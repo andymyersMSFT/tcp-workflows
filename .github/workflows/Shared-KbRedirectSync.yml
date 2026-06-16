@@ -133,13 +133,11 @@ jobs:
           $CallerRoot = (Resolve-Path 'caller').Path
           $Articles = Get-ChildItem -Path caller -Recurse -Filter *.md -File
 
-          $Redirections = New-Object System.Collections.Generic.List[object]
-          foreach ($Article in $Articles) {
+          $Redirections = foreach ($Article in $Articles) {
               # Determine the docset folder (top-level folder under the repo root)
               # and resolve its base path. Articles outside a mapped folder (e.g.
               # repo-root files) are skipped.
-              $RelPath = [System.IO.Path]::GetRelativePath($CallerRoot, $Article.FullName)
-              $RelPath = $RelPath -replace '\\', '/'
+              $RelPath = [System.IO.Path]::GetRelativePath($CallerRoot, $Article.FullName) -replace '\\', '/'
               $DocsetFolder = ($RelPath -split '/')[0]
               $BasePath = $FolderMap[$DocsetFolder]
               if ([string]::IsNullOrWhiteSpace($BasePath)) { continue }
@@ -158,23 +156,18 @@ jobs:
 
               # redirect_url = BasePath + the article path relative to its docset
               # folder, with the .md extension stripped (subfolders preserved).
-              $RelWithinFolder = $RelPath.Substring($DocsetFolder.Length).TrimStart('/')
-              $RelWithinFolder = $RelWithinFolder -replace '\.md$', ''
-              $RedirectUrl = "$BasePath/$RelWithinFolder"
+              $RelWithinFolder = ($RelPath.Substring($DocsetFolder.Length).TrimStart('/')) -replace '\.md$', ''
 
-              $Redirections.Add([PSCustomObject][ordered]@{
+              [ordered]@{
                   source_path_from_root = "/KB-Redirects/$KbId.md"
-                  redirect_url          = $RedirectUrl
+                  redirect_url          = "$BasePath/$RelWithinFolder"
                   redirect_document_id  = $false
-              })
+              }
           }
 
-          # Deterministic, idempotent output: sort entries by source_path_from_root
-          # using ordinal comparison so the order never depends on culture.
-          $Redirections.Sort([System.Comparison[object]] {
-              param($a, $b)
-              [string]::CompareOrdinal($a.source_path_from_root, $b.source_path_from_root)
-          })
+          # foreach yields $null for zero matches and a scalar for a single match;
+          # @() normalizes to an array.
+          $Redirections = @($Redirections)
 
           Write-Host "Generated $($Redirections.Count) redirection(s) for repo '$DocsetName'."
 
@@ -188,12 +181,11 @@ jobs:
               exit 0
           }
 
-          # Emit { "redirections": [ ... ] }. Build the array text explicitly so a
-          # single entry still serializes as a JSON array (PowerShell otherwise
-          # collapses single-element arrays).
-          $EntryJson = $Redirections | ForEach-Object { $_ | ConvertTo-Json -Depth 5 }
-          $Indented = ($EntryJson | ForEach-Object { ($_ -split "`n" | ForEach-Object { "    $_" }) -join "`n" }) -join ",`n"
-          $Json = "{`n  `"redirections`": [`n$Indented`n  ]`n}"
+          # Sort with the invariant culture (-Culture '') for a stable,
+          # locale-independent order, then serialize to { "redirections": [ ... ] }
+          # in a single pass. @() keeps a single entry as a JSON array.
+          $Sorted = @($Redirections | Sort-Object { $_.source_path_from_root } -Culture '')
+          $Json = @{ redirections = $Sorted } | ConvertTo-Json -Depth 5
 
           $RedirectFileName = ".openpublishing.redirection.$DocsetName-redirects.json"
           $TargetPath = Join-Path 'siteroot' (Join-Path 'KB-Redirects' $RedirectFileName)
@@ -201,11 +193,7 @@ jobs:
           if ($TargetDir -and -not (Test-Path $TargetDir)) {
               New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
           }
-          # Normalize to LF with a single trailing newline so the output is
-          # byte-identical regardless of the runner OS (keeps it deterministic /
-          # idempotent; on Windows ConvertTo-Json would otherwise emit CRLF).
-          $Json = (($Json -replace "`r`n", "`n") -replace "`r", "`n").TrimEnd("`n") + "`n"
-          Set-Content -LiteralPath $TargetPath -Value $Json -Encoding utf8 -NoNewline
+          $Json | Set-Content -LiteralPath $TargetPath -Encoding utf8
           Write-Host "Wrote redirect JSON to $TargetPath"
 
           # Ensure the generated redirect file is registered in the siteroot
@@ -230,7 +218,6 @@ jobs:
                       throw "Could not locate redirection_files array in $ConfigPath"
                   }
                   $NewConfig = $Rx.Replace($ConfigRaw, [System.Text.RegularExpressions.MatchEvaluator] { param($m) $Replacement }, 1)
-                  $NewConfig = ($NewConfig -replace "`r`n", "`n") -replace "`r", "`n"
                   [System.IO.File]::WriteAllText($ConfigPath, $NewConfig)
                   Write-Host "Added '$RelRedirectPath' to redirection_files in publish config."
               }
