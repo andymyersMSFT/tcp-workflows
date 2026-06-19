@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   assign-guids:
-    if: github.repository_owner == 'MicrosoftDocs'
+    if: github.repository_owner == 'andymyersMSFT'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main

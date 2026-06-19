@@ -1,0 +1,14 @@
+name: _test GUID assign
+
+# Throwaway caller to exercise Shared-GuidAssign in this fork. Delete before merging upstream.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  call:
+    uses: ./.github/workflows/Shared-GuidAssign.yml
+    with:
+      PayloadJson: '{}'
+    secrets:
+      AccessToken: ${{ secrets.GITHUB_TOKEN }}

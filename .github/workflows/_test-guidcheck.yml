@@ -1,0 +1,12 @@
+name: _test GUID check
+
+# Throwaway caller to exercise Shared-GuidCheck in this fork. Delete before merging upstream.
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  call:
+    uses: ./.github/workflows/Shared-GuidCheck.yml
+    secrets:
+      AccessToken: ${{ secrets.GITHUB_TOKEN }}
