@@ -1,5 +1,12 @@
 name: GUID check
 
+# Gates pull requests for awa-articleGuid issues:
+#   - duplicate GUIDs across the repo
+#   - changed / removed GUIDs on existing articles
+#   - new articles missing a GUID (suggested values are posted as a PR comment)
+# Each problem fails the job and comments on the PR. Mark this check as REQUIRED in the
+# calling repo's branch protection / ruleset so a failure blocks the merge.
+
 permissions:
   pull-requests: write
   contents: read
@@ -54,7 +61,7 @@ jobs:
               echo "$GUID" >> "$PATTERN_FILE"
               echo "Found GUID $GUID in $file"
             else
-              echo "No GUID in $file (will be assigned on merge)"
+              echo "No GUID in $file (a GUID is required before merge)"
             fi
           done <<< "$CHANGED_FILES"
 
@@ -64,12 +71,74 @@ jobs:
             echo "has_guids=false" >> "$GITHUB_OUTPUT"
             echo "# GUID check report" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "No GUIDs to check. Files without GUIDs will be assigned on merge." >> "$GITHUB_STEP_SUMMARY"
+            echo "No GUIDs to check. New files without a GUID are reported separately and must be fixed before merge." >> "$GITHUB_STEP_SUMMARY"
             rm -f "$PATTERN_FILE"
             exit 0
           fi
 
           echo "has_guids=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check for new files missing a GUID
+        id: missing
+        if: always()
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          # Only added files can be "missing" a GUID — modified files are handled by the
+          # changed/removed check below.
+          ADDED_FILES=$(git diff --name-only --diff-filter=A origin/${{ github.base_ref }}...HEAD -- '*.md' '**/*.md' | grep -v '/includes/' || true)
+
+          if [ -z "$ADDED_FILES" ]; then
+            echo "No newly added markdown files in this PR."
+            echo "has_missing=false" >> "$GITHUB_OUTPUT"
+            echo "## Missing GUIDs" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No newly added markdown files in this PR." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          > /tmp/missing_guids.txt
+
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+
+            # Skip files without frontmatter — they are not articles.
+            if ! head -1 "$file" | sed 's/^\xEF\xBB\xBF//' | tr -d '\r' | grep -q '^---$'; then
+              echo "Skipping $file (no frontmatter)"
+              continue
+            fi
+
+            GUID=$(sed '1s/^\xEF\xBB\xBF//' "$file" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
+            if [ -z "$GUID" ]; then
+              SUGGESTED=$(uuidgen | tr '[:upper:]' '[:lower:]')
+              printf '%s\t%s\n' "$file" "$SUGGESTED" >> /tmp/missing_guids.txt
+              echo "Missing GUID in $file (suggested $SUGGESTED)"
+            fi
+          done <<< "$ADDED_FILES"
+
+          if [ -s /tmp/missing_guids.txt ]; then
+            echo "has_missing=true" >> "$GITHUB_OUTPUT"
+            echo "::error::One or more new articles are missing an awa-articleGuid!"
+
+            echo "## Missing GUIDs" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**One or more new articles are missing an \`awa-articleGuid\`.** Add the suggested GUID to each file:" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| File | Suggested GUID |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|------|----------------|" >> "$GITHUB_STEP_SUMMARY"
+            while IFS=$'\t' read -r file guid; do
+              echo "| \`$file\` | \`$guid\` |" >> "$GITHUB_STEP_SUMMARY"
+            done < /tmp/missing_guids.txt
+
+            exit 1
+          fi
+
+          echo "All newly added articles already have a GUID."
+          echo "has_missing=false" >> "$GITHUB_OUTPUT"
+          echo "## Missing GUIDs" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "All newly added articles already have a GUID." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check for duplicates across repo
         id: check
@@ -333,6 +402,49 @@ jobs:
 
             for (const c of comments.data) {
               if (c.body.startsWith('## One or more duplicate GUIDs were found')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: c.id
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      - name: Comment on PR for missing GUIDs
+        if: always() && steps.missing.outputs.has_missing == 'true'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.AccessToken }}
+          script: |
+            const fs = require('fs');
+            const lines = fs.readFileSync('/tmp/missing_guids.txt', 'utf8').trim().split('\n');
+
+            let body = '## One or more new articles are missing a GUID\n\n';
+            body += 'Every new article must include an `awa-articleGuid` field in its frontmatter. ';
+            body += 'Add the suggested GUID below to each file (or supply your own unique GUID), then push to update this PR.\n\n';
+            body += '| File path | Add this GUID |\n| --- | --- |\n';
+
+            for (const line of lines) {
+              const [file, guid] = line.split('\t');
+              body += `| \`${file}\` | \`${guid}\` |\n`;
+            }
+
+            // Delete previous missing-GUID comments
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            for (const c of comments.data) {
+              if (c.body.startsWith('## One or more new articles are missing a GUID')) {
                 await github.rest.issues.deleteComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
