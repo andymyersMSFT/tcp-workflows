@@ -322,3 +322,42 @@ jobs:
           if (-not $Enabled) {
               Write-Host "::warning::Could not enable auto-merge for PR #$PrNumber. Manual merge may be required."
           }
+
+          # --- Visibility: label the PR and post a status comment ---------------
+          # Helps the PR get noticed when it needs human action (approval or a
+          # manual merge under 'changes via PR' rules). Harmless when auto-merge
+          # completes unattended. Labeling/commenting failures are non-fatal.
+          function Add-PrLabel {
+              param([int] $Number, [string] $Name, [string] $Color, [string] $Description)
+              try {
+                  $LabelBody = @{ name = $Name; color = $Color; description = $Description } | ConvertTo-Json
+                  Invoke-RestMethod -Uri "https://api.github.com/repos/$SiterootRepo/labels" -Method POST -Headers $Headers -Body $LabelBody -ErrorAction Stop | Out-Null
+              } catch {
+                  # A 422 means the label already exists; any other error is non-fatal here.
+              }
+              try {
+                  $AddBody = @{ labels = @($Name) } | ConvertTo-Json
+                  Invoke-RestMethod -Uri "https://api.github.com/repos/$SiterootRepo/issues/$Number/labels" -Method POST -Headers $Headers -Body $AddBody -ErrorAction Stop | Out-Null
+              } catch {
+                  Write-Host "::warning::Could not add label '$Name' to PR #$Number`: $_"
+              }
+          }
+
+          function Add-PrComment {
+              param([int] $Number, [string] $Body)
+              try {
+                  $CommentBody = @{ body = $Body } | ConvertTo-Json
+                  Invoke-RestMethod -Uri "https://api.github.com/repos/$SiterootRepo/issues/$Number/comments" -Method POST -Headers $Headers -Body $CommentBody -ErrorAction Stop | Out-Null
+              } catch {
+                  Write-Host "::warning::Could not comment on PR #$Number`: $_"
+              }
+          }
+
+          Add-PrLabel -Number $PrNumber -Name 'KB redirect sync' -Color '1d76db' -Description 'Automated KB redirect sync pull request.'
+
+          if ($Enabled) {
+              Add-PrComment -Number $PrNumber -Body "Auto-merge is enabled for this KB redirect sync PR. It will merge automatically once all required status checks (and any required approvals) are satisfied. If this repository requires a review, a maintainer needs to approve it before the merge can proceed."
+          } else {
+              Add-PrLabel -Number $PrNumber -Name 'Manual merge required' -Color 'f79d43' -Description 'An automated PR could not be auto-merged and needs a manual merge.'
+              Add-PrComment -Number $PrNumber -Body "Auto-merge could not be enabled for this KB redirect sync PR, so it will not merge on its own. A maintainer needs to review and merge it manually to publish the updated KB redirects."
+          }
