@@ -6,6 +6,11 @@ name: GUID check
 #   - new articles missing a GUID (suggested values are posted as a PR comment)
 # Each problem fails the job and comments on the PR. Mark this check as REQUIRED in the
 # calling repo's branch protection / ruleset so a failure blocks the merge.
+#
+# This workflow runs on `pull_request_target` (via the caller) so fork PRs are never
+# gated behind a manual "Approve and run" click. For security, it never checks out fork
+# code: the base branch is checked out (trusted) for the repo-wide GUID inventory, and
+# the PR's changed .md files are downloaded as DATA via the GitHub API (never executed).
 
 permissions:
   pull-requests: write
@@ -21,12 +26,108 @@ jobs:
   check-guids:
     if: github.repository_owner == 'MicrosoftDocs'
     runs-on: ubuntu-latest
+    env:
+      # Passed via env (not inlined into run scripts) to avoid expression injection.
+      BASE_REF: ${{ github.base_ref }}
     steps:
-      - name: Checkout
+      # PR_FILES_DIR holds untrusted PR file content as data only (never executed).
+      # Set here (not at job-level env) because the runner context isn't available there.
+      - name: Set up workspace paths
+        run: echo "PR_FILES_DIR=$RUNNER_TEMP/pr-files" >> "$GITHUB_ENV"
+
+      # Trusted base checkout for the repo-wide duplicate inventory and base-side GUID
+      # reads. No `ref:` -> under pull_request_target this is the base branch we control.
+      # persist-credentials: false keeps the privileged token out of .git/config; all
+      # analysis below is local git reads that need no credentials.
+      - name: Checkout base (trusted)
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          token: ${{ secrets.AccessToken }}
+          persist-credentials: false
+
+      # Download the PR's changed .md files as DATA via the API. Nothing from the fork is
+      # placed in the working tree or executed. Content is fetched at the immutable head
+      # SHA (no TOCTOU) and the disk path is validated to stay inside PR_FILES_DIR.
+      - name: Download PR changed .md files via API (data only)
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.AccessToken }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const pr = context.payload.pull_request;
+            const headSha = pr.head.sha;                 // immutable commit, not a branch
+            const headRepo = pr.head.repo;               // fork repo (may equal base)
+            const outDir = process.env.PR_FILES_DIR;
+            fs.mkdirSync(outDir, { recursive: true });
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const manifest = [];
+            for (const f of files) {
+              if (!f.filename.endsWith('.md')) continue;
+              if (f.filename.includes('/includes/')) continue;
+
+              manifest.push({
+                path: f.filename,
+                status: f.status,
+                previous: f.previous_filename || null,
+              });
+
+              if (f.status === 'removed') continue;
+
+              // Resolve destination and guard against path traversal (defense in depth).
+              const dest = path.resolve(outDir, f.filename);
+              const rel = path.relative(outDir, dest);
+              if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+                core.setFailed(`Refusing to write outside PR_FILES_DIR: ${f.filename}`);
+                throw new Error('path traversal');
+              }
+
+              // Fetch file content at the head SHA as DATA. Prefer the fork repo at the
+              // immutable SHA (reliable for cross-fork commits); fall back to the
+              // per-file contents_url from listFiles.
+              let buf = null;
+              try {
+                const res = await github.rest.repos.getContent({
+                  owner: headRepo.owner.login,
+                  repo: headRepo.name,
+                  path: f.filename,
+                  ref: headSha,
+                });
+                if (res.data && res.data.content) {
+                  buf = Buffer.from(res.data.content, res.data.encoding || 'base64');
+                }
+              } catch (e) {
+                core.info(`getContent failed for ${f.filename}: ${e.message}; trying contents_url`);
+              }
+              if (buf === null && f.contents_url) {
+                try {
+                  const res = await github.request(f.contents_url);
+                  if (res.data && res.data.content) {
+                    buf = Buffer.from(res.data.content, res.data.encoding || 'base64');
+                  }
+                } catch (e) {
+                  core.info(`contents_url fetch failed for ${f.filename}: ${e.message}`);
+                }
+              }
+              if (buf === null) {
+                core.warning(`Could not fetch content for ${f.filename}; skipping its content checks.`);
+                continue;
+              }
+
+              fs.mkdirSync(path.dirname(dest), { recursive: true });
+              fs.writeFileSync(dest, buf);
+            }
+
+            fs.writeFileSync(path.join(outDir, '_manifest.json'), JSON.stringify(manifest));
+            core.info(`Manifest: ${manifest.length} markdown file(s).`);
 
       - name: Extract GUIDs from PR files
         id: extract
@@ -34,10 +135,12 @@ jobs:
           LC_ALL=C
           export LC_ALL
 
-          # Get markdown files added or modified in this PR
-          CHANGED_FILES=$(git diff --name-only --diff-filter=AM origin/${{ github.base_ref }}...HEAD -- '*.md' '**/*.md' | grep -v '/includes/' || true)
+          MANIFEST="$PR_FILES_DIR/_manifest.json"
 
-          if [ -z "$CHANGED_FILES" ]; then
+          # Files that may carry a GUID in this PR (present content): added/modified/renamed.
+          mapfile -t PR_FILES < <(jq -r '.[] | select(.status=="added" or .status=="modified" or .status=="renamed") | .path' "$MANIFEST" 2>/dev/null)
+
+          if [ "${#PR_FILES[@]}" -eq 0 ]; then
             echo "No markdown files changed in this PR."
             echo "has_guids=false" >> "$GITHUB_OUTPUT"
             echo "# GUID check report" >> "$GITHUB_STEP_SUMMARY"
@@ -47,23 +150,26 @@ jobs:
           fi
 
           echo "Changed files:"
-          echo "$CHANGED_FILES"
+          printf '%s\n' "${PR_FILES[@]}"
           echo ""
 
-          # Extract GUIDs from changed files into a pattern file
+          # Extract GUIDs from PR (head) content into a pattern file + a guid/file map.
           PATTERN_FILE=$(mktemp)
           echo "pattern_file=$PATTERN_FILE" >> "$GITHUB_OUTPUT"
+          : > /tmp/pr_guid_files.tsv
 
-          while IFS= read -r file; do
-            [ -f "$file" ] || continue
-            GUID=$(sed '1s/^\xEF\xBB\xBF//' "$file" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
+          for file in "${PR_FILES[@]}"; do
+            src="$PR_FILES_DIR/$file"
+            [ -f "$src" ] || continue
+            GUID=$(sed '1s/^\xEF\xBB\xBF//' "$src" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
             if [ -n "$GUID" ]; then
               echo "$GUID" >> "$PATTERN_FILE"
+              printf '%s\t%s\n' "$GUID" "$file" >> /tmp/pr_guid_files.tsv
               echo "Found GUID $GUID in $file"
             else
-              echo "No GUID in $file (a GUID is required before merge)"
+              echo "No GUID in $file (a GUID is required for new articles before merge)"
             fi
-          done <<< "$CHANGED_FILES"
+          done
 
           if [ ! -s "$PATTERN_FILE" ]; then
             echo ""
@@ -85,11 +191,13 @@ jobs:
           LC_ALL=C
           export LC_ALL
 
-          # Only added files can be "missing" a GUID — modified files are handled by the
-          # changed/removed check below.
-          ADDED_FILES=$(git diff --name-only --diff-filter=A origin/${{ github.base_ref }}...HEAD -- '*.md' '**/*.md' | grep -v '/includes/' || true)
+          MANIFEST="$PR_FILES_DIR/_manifest.json"
 
-          if [ -z "$ADDED_FILES" ]; then
+          # Only newly added files can be "missing" a GUID — modified/renamed files keep
+          # their GUID and are covered by the changed/removed check below.
+          mapfile -t ADDED_FILES < <(jq -r '.[] | select(.status=="added") | .path' "$MANIFEST" 2>/dev/null)
+
+          if [ "${#ADDED_FILES[@]}" -eq 0 ]; then
             echo "No newly added markdown files in this PR."
             echo "has_missing=false" >> "$GITHUB_OUTPUT"
             echo "## Missing GUIDs" >> "$GITHUB_STEP_SUMMARY"
@@ -100,22 +208,23 @@ jobs:
 
           > /tmp/missing_guids.txt
 
-          while IFS= read -r file; do
-            [ -f "$file" ] || continue
+          for file in "${ADDED_FILES[@]}"; do
+            src="$PR_FILES_DIR/$file"
+            [ -f "$src" ] || continue
 
             # Skip files without frontmatter — they are not articles.
-            if ! head -1 "$file" | sed 's/^\xEF\xBB\xBF//' | tr -d '\r' | grep -q '^---$'; then
+            if ! head -1 "$src" | sed 's/^\xEF\xBB\xBF//' | tr -d '\r' | grep -q '^---$'; then
               echo "Skipping $file (no frontmatter)"
               continue
             fi
 
-            GUID=$(sed '1s/^\xEF\xBB\xBF//' "$file" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
+            GUID=$(sed '1s/^\xEF\xBB\xBF//' "$src" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
             if [ -z "$GUID" ]; then
               SUGGESTED=$(uuidgen | tr '[:upper:]' '[:lower:]')
               printf '%s\t%s\n' "$file" "$SUGGESTED" >> /tmp/missing_guids.txt
               echo "Missing GUID in $file (suggested $SUGGESTED)"
             fi
-          done <<< "$ADDED_FILES"
+          done
 
           if [ -s /tmp/missing_guids.txt ]; then
             echo "has_missing=true" >> "$GITHUB_OUTPUT"
@@ -149,43 +258,76 @@ jobs:
 
           PATTERN_FILE="${{ steps.extract.outputs.pattern_file }}"
 
-          DUPES=$(find . -name '*.md' -not -path '*/includes/*' -print0 | \
-            xargs -0 awk '
+          # Base-side paths touched by this PR (modified path, renamed-from previous,
+          # removed path). These are excluded from the base inventory so a file that
+          # simply keeps its own GUID isn't flagged as a duplicate against its own base
+          # copy. The merged repo state = (base minus these paths) plus the PR files.
+          jq -r '.[] | (.previous // .path)' "$PR_FILES_DIR/_manifest.json" 2>/dev/null > /tmp/pr_base_paths.txt || true
+
+          # Base-branch inventory: which base .md files contain one of the PR GUIDs.
+          # The PR GUID values are read from PATTERN_FILE as DATA (getline) and the file
+          # paths are passed as awk variables — PR-derived values never become program text.
+          find . -name '*.md' -not -path '*/includes/*' -print0 | \
+            xargs -0 awk -v PF="$PATTERN_FILE" -v EX="/tmp/pr_base_paths.txt" '
               BEGIN {
-                while ((getline g < "'"$PATTERN_FILE"'") > 0) {
+                while ((getline g < PF) > 0) {
                   gsub(/[[:space:]]/, "", g)
-                  if (length(g) > 0) guids[tolower(g)] = 1
+                  if (length(g) > 0) want[tolower(g)] = 1
+                }
+                while ((getline p < EX) > 0) {
+                  if (length(p) > 0) exclude[p] = 1
                 }
               }
+              FNR == 1 {
+                fn = FILENAME
+                sub(/^\.\//, "", fn)
+                skip = (fn in exclude)
+              }
+              skip { nextfile }
               FNR > 50 { nextfile }
               tolower($0) ~ /awa-articleguid:/ {
                 val = $0
                 sub(/^[^:]*:[[:space:]]*/, "", val)
                 gsub(/[[:space:]]/, "", val)
                 val = tolower(val)
-                if (val in guids) {
-                  count[val]++
-                  files[val] = files[val] FILENAME "|"
+                if (val in want) {
+                  print val "\t" fn
                 }
                 nextfile
               }
-              END {
-                for (g in count) {
-                  if (count[g] > 1) {
-                    print g "\t" files[g]
-                  }
+            ' > /tmp/base_guid_files.tsv || true
+
+          rm -f "$PATTERN_FILE"
+
+          # A GUID is a duplicate if it already exists on the base branch, or if it
+          # appears in more than one file in this PR. Emit "guid<TAB>file1|file2|..."
+          # (base files first, then PR files) for the comment step.
+          awk -F'\t' '
+            FNR == NR {
+              g = tolower($1); f = $2
+              files[g] = files[g] f "|"
+              base[g] = 1
+              next
+            }
+            {
+              g = tolower($1); f = $2
+              files[g] = files[g] f "|"
+              prcount[g]++
+              pr[g] = 1
+            }
+            END {
+              for (g in pr) {
+                if (base[g] == 1 || prcount[g] > 1) {
+                  print g "\t" files[g]
                 }
               }
-            ' || true)
+            }
+          ' /tmp/base_guid_files.tsv /tmp/pr_guid_files.tsv > /tmp/dupes.txt || true
 
-          rm "$PATTERN_FILE"
-
-          if [ -n "$DUPES" ]; then
-            echo "$DUPES" > /tmp/dupes.txt
+          if [ -s /tmp/dupes.txt ]; then
             echo "has_dupes=true" >> "$GITHUB_OUTPUT"
             echo "::error::Duplicate awa-articleGuid values found in this PR!"
 
-            # Write job summary for duplicates
             echo "# GUID check report" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "## Duplicate GUIDs" >> "$GITHUB_STEP_SUMMARY"
@@ -197,7 +339,7 @@ jobs:
             while IFS=$'\t' read -r guid filestr; do
               files=$(echo "$filestr" | tr '|' ',' | sed 's/,$//' | sed 's|\./||g')
               echo "| \`$guid\` | $files |" >> "$GITHUB_STEP_SUMMARY"
-            done <<< "$DUPES"
+            done < /tmp/dupes.txt
 
             exit 1
           fi
@@ -216,13 +358,13 @@ jobs:
           LC_ALL=C
           export LC_ALL
 
-          # Get modified + renamed files — added files can't have a changed GUID.
-          # --name-status output per line:
-          #   M<TAB>path
-          #   R<score><TAB>old_path<TAB>new_path
-          MODIFIED_FILES=$(git diff --name-status --find-renames --diff-filter=MR origin/${{ github.base_ref }}...HEAD -- '*.md' '**/*.md' || true)
+          MANIFEST="$PR_FILES_DIR/_manifest.json"
 
-          if [ -z "$MODIFIED_FILES" ]; then
+          # Modified + renamed files — added files can't have a changed GUID.
+          # Output: new_path<TAB>old_path  (old_path = previous filename for renames).
+          jq -r '.[] | select(.status=="modified" or .status=="renamed") | [.path, (.previous // .path)] | @tsv' "$MANIFEST" 2>/dev/null > /tmp/modified.tsv
+
+          if [ ! -s /tmp/modified.tsv ]; then
             echo "No modified or renamed markdown files in this PR."
             echo "has_changed=false" >> "$GITHUB_OUTPUT"
             echo "## Changed GUIDs" >> "$GITHUB_STEP_SUMMARY"
@@ -233,26 +375,21 @@ jobs:
 
           > /tmp/changed_guids.txt
 
-          while IFS=$'\t' read -r status field2 field3; do
-            case "$status" in
-              M)  old_path="$field2"; new_path="$field2" ;;
-              R*) old_path="$field2"; new_path="$field3" ;;
-              *)  continue ;;
-            esac
-
-            # Skip the /includes/ directory on either side
+          while IFS=$'\t' read -r new_path old_path; do
+            # Skip the /includes/ directory on either side (already filtered, belt + braces)
             case "$old_path" in */includes/*) continue ;; esac
             case "$new_path" in */includes/*) continue ;; esac
 
-            [ -f "$new_path" ] || continue
+            src="$PR_FILES_DIR/$new_path"
+            [ -f "$src" ] || continue
 
-            # Get current GUID from the working tree (new path)
-            CURRENT_GUID=$(sed '1s/^\xEF\xBB\xBF//' "$new_path" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
+            # Current GUID from the PR (head) content fetched via API.
+            CURRENT_GUID=$(sed '1s/^\xEF\xBB\xBF//' "$src" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
 
-            # Get base branch GUID from the OLD path (handles renames correctly)
-            BASE_GUID=$(git show "origin/${{ github.base_ref }}:${old_path}" 2>/dev/null | sed '1s/^\xEF\xBB\xBF//' | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
+            # Base branch GUID from the OLD path (handles renames correctly).
+            BASE_GUID=$(git show "origin/$BASE_REF:$old_path" 2>/dev/null | sed '1s/^\xEF\xBB\xBF//' | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
 
-            # Nothing to protect if the base had no GUID
+            # Nothing to protect if the base had no GUID.
             if [ -z "$BASE_GUID" ]; then
               continue
             fi
@@ -265,7 +402,7 @@ jobs:
               printf '%s\t%s\t%s\n' "$new_path" "$BASE_GUID" "$CURRENT_GUID" >> /tmp/changed_guids.txt
               echo "GUID changed in $new_path: $BASE_GUID -> $CURRENT_GUID"
             fi
-          done <<< "$MODIFIED_FILES"
+          done < /tmp/modified.tsv
 
           if [ -s /tmp/changed_guids.txt ]; then
             echo "has_changed=true" >> "$GITHUB_OUTPUT"
@@ -340,15 +477,19 @@ jobs:
           script: |
             const fs = require('fs');
             const crypto = require('crypto');
-            const { execSync } = require('child_process');
+            const { execFileSync } = require('child_process');
 
             const dupes = fs.readFileSync('/tmp/dupes.txt', 'utf8').trim();
             const baseRef = process.env.GITHUB_BASE_REF || 'main';
 
-            // Check if a file had this GUID on the base branch
+            // Check if a file had this GUID on the base branch. The file path is passed
+            // as an argv element (no shell), so a crafted filename can't inject a command.
             function hadGuidOnBase(file, guid) {
               try {
-                const content = execSync(`git show "origin/${baseRef}:${file}" 2>/dev/null`, { encoding: 'utf8' });
+                const content = execFileSync('git', ['show', `origin/${baseRef}:${file}`], {
+                  encoding: 'utf8',
+                  stdio: ['ignore', 'pipe', 'ignore'], // discard stderr (replaces 2>/dev/null)
+                });
                 const match = content.match(/awa-articleGuid:\s*(\S+)/i);
                 return match && match[1].toLowerCase() === guid.toLowerCase();
               } catch {
