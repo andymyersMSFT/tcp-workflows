@@ -184,7 +184,7 @@ jobs:
 
           echo "has_guids=true" >> "$GITHUB_OUTPUT"
 
-      - name: Check for new files missing a GUID
+      - name: Check for articles missing a GUID
         id: missing
         if: always()
         run: |
@@ -193,46 +193,59 @@ jobs:
 
           MANIFEST="$PR_FILES_DIR/_manifest.json"
 
-          # Only newly added files can be "missing" a GUID — modified/renamed files keep
-          # their GUID and are covered by the changed/removed check below.
-          mapfile -t ADDED_FILES < <(jq -r '.[] | select(.status=="added") | .path' "$MANIFEST" 2>/dev/null)
+          # Any added, modified, or renamed article touched by this PR must carry a GUID.
+          # Output: status<TAB>new_path<TAB>old_path  (old_path = previous name for renames).
+          jq -r '.[] | select(.status=="added" or .status=="modified" or .status=="renamed") | [.status, .path, (.previous // .path)] | @tsv' "$MANIFEST" 2>/dev/null > /tmp/candidate_files.tsv
 
-          if [ "${#ADDED_FILES[@]}" -eq 0 ]; then
-            echo "No newly added markdown files in this PR."
+          if [ ! -s /tmp/candidate_files.tsv ]; then
+            echo "No added, modified, or renamed markdown files in this PR."
             echo "has_missing=false" >> "$GITHUB_OUTPUT"
             echo "## Missing GUIDs" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "No newly added markdown files in this PR." >> "$GITHUB_STEP_SUMMARY"
+            echo "No added, modified, or renamed markdown files in this PR." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           > /tmp/missing_guids.txt
 
-          for file in "${ADDED_FILES[@]}"; do
-            src="$PR_FILES_DIR/$file"
+          while IFS=$'\t' read -r status new_path old_path; do
+            src="$PR_FILES_DIR/$new_path"
             [ -f "$src" ] || continue
 
             # Skip files without frontmatter — they are not articles.
             if ! head -1 "$src" | sed 's/^\xEF\xBB\xBF//' | tr -d '\r' | grep -q '^---$'; then
-              echo "Skipping $file (no frontmatter)"
+              echo "Skipping $new_path (no frontmatter)"
               continue
             fi
 
             GUID=$(sed '1s/^\xEF\xBB\xBF//' "$src" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
-            if [ -z "$GUID" ]; then
-              SUGGESTED=$(uuidgen | tr '[:upper:]' '[:lower:]')
-              printf '%s\t%s\n' "$file" "$SUGGESTED" >> /tmp/missing_guids.txt
-              echo "Missing GUID in $file (suggested $SUGGESTED)"
+
+            # Article already has a GUID — nothing to do here.
+            if [ -n "$GUID" ]; then
+              continue
             fi
-          done
+
+            # For modified/renamed files, skip if the BASE version had a GUID: that is a
+            # removal, handled (with a restore suggestion) by the changed/removed check.
+            if [ "$status" != "added" ]; then
+              BASE_GUID=$(git show "origin/$BASE_REF:$old_path" 2>/dev/null | sed '1s/^\xEF\xBB\xBF//' | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
+              if [ -n "$BASE_GUID" ]; then
+                continue
+              fi
+            fi
+
+            SUGGESTED=$(uuidgen | tr '[:upper:]' '[:lower:]')
+            printf '%s\t%s\n' "$new_path" "$SUGGESTED" >> /tmp/missing_guids.txt
+            echo "Missing GUID in $new_path (suggested $SUGGESTED)"
+          done < /tmp/candidate_files.tsv
 
           if [ -s /tmp/missing_guids.txt ]; then
             echo "has_missing=true" >> "$GITHUB_OUTPUT"
-            echo "::error::One or more new articles are missing an awa-articleGuid!"
+            echo "::error::One or more articles are missing an awa-articleGuid!"
 
             echo "## Missing GUIDs" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**One or more new articles are missing an \`awa-articleGuid\`.** Add the suggested GUID to each file:" >> "$GITHUB_STEP_SUMMARY"
+            echo "**One or more articles are missing an \`awa-articleGuid\`.** Add the suggested GUID to each file:" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "| File | Suggested GUID |" >> "$GITHUB_STEP_SUMMARY"
             echo "|------|----------------|" >> "$GITHUB_STEP_SUMMARY"
@@ -243,11 +256,11 @@ jobs:
             exit 1
           fi
 
-          echo "All newly added articles already have a GUID."
+          echo "All touched articles already have a GUID."
           echo "has_missing=false" >> "$GITHUB_OUTPUT"
           echo "## Missing GUIDs" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "All newly added articles already have a GUID." >> "$GITHUB_STEP_SUMMARY"
+          echo "All touched articles already have a GUID." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check for duplicates across repo
         id: check
