@@ -24,7 +24,7 @@ on:
 
 jobs:
   check-guids:
-    if: github.repository_owner == 'MicrosoftDocs'
+    if: github.repository_owner == 'MicrosoftDocs' || github.repository_owner == 'andymyersMSFT'
     runs-on: ubuntu-latest
     env:
       # Passed via env (not inlined into run scripts) to avoid expression injection.
