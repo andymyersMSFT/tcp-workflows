@@ -427,176 +427,155 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "No GUIDs were accidentally changed or removed." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Comment on PR for changed GUIDs
-        if: always() && steps.changed.outputs.has_changed == 'true'
+
+      - name: Post inline GUID suggestions
+        if: always()
         uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.AccessToken }}
           script: |
             const fs = require('fs');
-            const lines = fs.readFileSync('/tmp/changed_guids.txt', 'utf8').trim().split('\n');
-
-            let body = '## One or more GUIDs were accidentally changed or removed\n\n';
-            body += 'The `awa-articleGuid` field must not be modified or removed for existing articles. Please restore the original GUID for each file listed below.\n\n';
-            body += '| File path | Restore to | Current (incorrect) |\n| --- | --- | --- |\n';
-
-            for (const line of lines) {
-              const [file, baseGuid, currentGuid] = line.split('\t');
-              body += `| \`${file}\` | \`${baseGuid}\` | \`${currentGuid}\` |\n`;
-            }
-
-            // Delete previous changed-GUID comments (matches both old and new title prefixes)
-            const comments = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number
-            });
-
-            for (const c of comments.data) {
-              if (c.body.startsWith('## One or more GUIDs were accidentally changed')) {
-                await github.rest.issues.deleteComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: c.id
-                });
-              }
-            }
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: body
-            });
-
-      - name: Comment on PR for duplicate GUIDs
-        if: always() && steps.check.outputs.has_dupes == 'true'
-        uses: actions/github-script@v8
-        with:
-          github-token: ${{ secrets.AccessToken }}
-          script: |
-            const fs = require('fs');
+            const path = require('path');
             const crypto = require('crypto');
             const { execFileSync } = require('child_process');
 
-            const dupes = fs.readFileSync('/tmp/dupes.txt', 'utf8').trim();
-            const baseRef = process.env.GITHUB_BASE_REF || 'main';
+            // Triple backtick built as a variable so it doesn't clash with JS template literals.
+            const F = String.fromCharCode(96, 96, 96);
+            const MARKER = '<!-- guidcheck-suggestion -->';
+            const prFilesDir = process.env.PR_FILES_DIR;
+            const baseRef = process.env.GITHUB_BASE_REF || process.env.BASE_REF || 'main';
+            const pr = context.payload.pull_request;
+            const commitId = pr.head.sha;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = pr.number;
 
-            // Check if a file had this GUID on the base branch. The file path is passed
-            // as an argv element (no shell), so a crafted filename can't inject a command.
+            function readTsv(p) {
+              try {
+                const t = fs.readFileSync(p, 'utf8').trim();
+                return t ? t.split('\n') : [];
+              } catch (e) { return []; }
+            }
+            function fileLines(rel) {
+              return fs.readFileSync(path.join(prFilesDir, rel), 'utf8').replace(/\r/g, '').split('\n');
+            }
+            function guidLine(rel) {
+              try {
+                const lines = fileLines(rel);
+                for (let i = 0; i < lines.length; i++) {
+                  if (/^awa-articleGuid:/i.test(lines[i])) return i + 1;
+                }
+              } catch (e) {}
+              return null;
+            }
+            function firstLine(rel) {
+              try { return fileLines(rel)[0] || '---'; } catch (e) { return '---'; }
+            }
             function hadGuidOnBase(file, guid) {
               try {
-                const content = execFileSync('git', ['show', `origin/${baseRef}:${file}`], {
-                  encoding: 'utf8',
-                  stdio: ['ignore', 'pipe', 'ignore'], // discard stderr (replaces 2>/dev/null)
+                const content = execFileSync('git', ['show', 'origin/' + baseRef + ':' + file], {
+                  encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
                 });
-                const match = content.match(/awa-articleGuid:\s*(\S+)/i);
-                return match && match[1].toLowerCase() === guid.toLowerCase();
-              } catch {
-                return false;
+                const m = content.match(/awa-articleGuid:\s*(\S+)/i);
+                return m && m[1].toLowerCase() === guid.toLowerCase();
+              } catch (e) { return false; }
+            }
+
+            // Remove our previous suggestion comments (and legacy plain comments) so re-runs
+            // don't pile up and resolved issues get cleaned away.
+            const oldReview = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+            for (const c of oldReview) {
+              if (c.body && c.body.includes(MARKER)) {
+                try { await github.rest.pulls.deleteReviewComment({ owner, repo, comment_id: c.id }); } catch (e) {}
+              }
+            }
+            const oldIssue = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            for (const c of oldIssue) {
+              const b = c.body || '';
+              if (b.includes(MARKER)
+                || b.startsWith('## One or more new articles are missing a GUID')
+                || b.startsWith('## One or more duplicate GUIDs were found')
+                || b.startsWith('## One or more GUIDs were accidentally changed')) {
+                try { await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id }); } catch (e) {}
               }
             }
 
-            let body = '## One or more duplicate GUIDs were found\n\n';
-            body += 'Update the `awa-articleGuid` field in each file in the **Action required** table with the provided GUID.\n\n';
+            const items = [];
 
-            for (const line of dupes.split('\n')) {
-              const [guid, fileStr] = line.split('\t');
-              const allFiles = fileStr.split('|').filter(Boolean).map(f => f.replace(/^\.\//, ''));
+            // Missing GUID (added articles): insert the suggested GUID after the opening '---'.
+            for (const ln of readTsv('/tmp/missing_guids.txt')) {
+              const parts = ln.split('\t');
+              const file = parts[0]; const guid = parts[1];
+              if (!file) continue;
+              const body = '**Missing `awa-articleGuid`.** This new article needs a unique GUID. '
+                + 'Click **Commit suggestion** to add the one below (or edit it to your own), then it is saved to this PR.\n\n'
+                + F + 'suggestion\n' + firstLine(file) + '\nawa-articleGuid: ' + guid + '\n' + F + '\n' + MARKER;
+              items.push({ file: file, line: 1, body: body });
+            }
 
-              const keepFiles = allFiles.filter(f => hadGuidOnBase(f, guid));
-              const changeFiles = allFiles.filter(f => !hadGuidOnBase(f, guid));
-
-              // If all files are new to this GUID, keep the first one and change the rest
-              if (keepFiles.length === 0 && changeFiles.length > 1) {
-                keepFiles.push(changeFiles.shift());
+            // Changed / removed GUID (existing articles): restore the original GUID.
+            for (const ln of readTsv('/tmp/changed_guids.txt')) {
+              const parts = ln.split('\t');
+              const file = parts[0]; const baseGuid = parts[1]; const current = parts[2];
+              if (!file) continue;
+              if (current === '(removed)') {
+                const body = '**`awa-articleGuid` was removed.** Existing articles must keep their GUID. '
+                  + 'Click **Commit suggestion** to restore it.\n\n'
+                  + F + 'suggestion\n' + firstLine(file) + '\nawa-articleGuid: ' + baseGuid + '\n' + F + '\n' + MARKER;
+                items.push({ file: file, line: 1, body: body });
+              } else {
+                const gl = guidLine(file);
+                if (gl) {
+                  const body = '**`awa-articleGuid` was changed.** Existing articles must keep their original GUID. '
+                    + 'Click **Commit suggestion** to restore it.\n\n'
+                    + F + 'suggestion\nawa-articleGuid: ' + baseGuid + '\n' + F + '\n' + MARKER;
+                  items.push({ file: file, line: gl, body: body });
+                }
               }
+            }
 
-              body += `**Duplicate GUID:** \`${guid}\`\n\n`;
-
-              if (changeFiles.length > 0) {
-                body += 'Action required:\n';
-                body += '| File path | Update to | New GUID |\n| --- | :---: | --- |\n';
-                for (const f of changeFiles) {
+            // Duplicate GUID: change the PR-side file(s) to a new unique GUID.
+            for (const ln of readTsv('/tmp/dupes.txt')) {
+              const parts = ln.split('\t');
+              const guid = parts[0]; const fileStr = parts[1];
+              if (!guid || !fileStr) continue;
+              const all = fileStr.split('|').filter(Boolean).map(function (f) { return f.replace(/^\.\//, ''); });
+              const keep = all.filter(function (f) { return hadGuidOnBase(f, guid); });
+              let change = all.filter(function (f) { return !hadGuidOnBase(f, guid); });
+              if (keep.length === 0 && change.length > 1) change = change.slice(1);
+              for (const f of change) {
+                const gl = guidLine(f);
+                if (gl) {
                   const newGuid = crypto.randomUUID();
-                  body += `| \`${f}\` | \u2192 | \`${newGuid}\` |\n`;
+                  const body = '**Duplicate `awa-articleGuid`** \u2014 `' + guid + '` is already used by another article. '
+                    + 'Click **Commit suggestion** to replace it with a new unique GUID.\n\n'
+                    + F + 'suggestion\nawa-articleGuid: ' + newGuid + '\n' + F + '\n' + MARKER;
+                  items.push({ file: f, line: gl, body: body });
                 }
-                body += '\n';
-              }
-
-              if (keepFiles.length > 0) {
-                body += 'Do not change:\n';
-                body += '| File path | Current GUID |\n| --- | --- |\n';
-                for (const f of keepFiles) {
-                  body += `| \`${f}\` | \`${guid}\` |\n`;
-                }
-                body += '\n';
               }
             }
 
-            // Delete previous duplicate GUID comments
-            const comments = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number
-            });
-
-            for (const c of comments.data) {
-              if (c.body.startsWith('## One or more duplicate GUIDs were found')) {
-                await github.rest.issues.deleteComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: c.id
+            let posted = 0, fallback = 0;
+            for (const it of items) {
+              try {
+                await github.rest.pulls.createReviewComment({
+                  owner: owner, repo: repo, pull_number: prNumber, commit_id: commitId,
+                  path: it.file, line: it.line, side: 'RIGHT', body: it.body,
                 });
+                posted++;
+              } catch (e) {
+                core.warning('Inline suggestion failed for ' + it.file + ':' + it.line + ' (' + e.message + '); posting a plain comment.');
+                try {
+                  await github.rest.issues.createComment({
+                    owner: owner, repo: repo, issue_number: prNumber,
+                    body: it.body + '\n\n_(Could not attach inline on `' + it.file + '`.)_',
+                  });
+                  fallback++;
+                } catch (e2) {}
               }
             }
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: body
-            });
-
-      - name: Comment on PR for missing GUIDs
-        if: always() && steps.missing.outputs.has_missing == 'true'
-        uses: actions/github-script@v8
-        with:
-          github-token: ${{ secrets.AccessToken }}
-          script: |
-            const fs = require('fs');
-            const lines = fs.readFileSync('/tmp/missing_guids.txt', 'utf8').trim().split('\n');
-
-            let body = '## One or more new articles are missing a GUID\n\n';
-            body += 'Every new article must include an `awa-articleGuid` field in its frontmatter. ';
-            body += 'Add the suggested GUID below to each file (or supply your own unique GUID), then push to update this PR.\n\n';
-            body += '| File path | Add this GUID |\n| --- | --- |\n';
-
-            for (const line of lines) {
-              const [file, guid] = line.split('\t');
-              body += `| \`${file}\` | \`${guid}\` |\n`;
-            }
-
-            // Delete previous missing-GUID comments
-            const comments = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number
-            });
-
-            for (const c of comments.data) {
-              if (c.body.startsWith('## One or more new articles are missing a GUID')) {
-                await github.rest.issues.deleteComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: c.id
-                });
-              }
-            }
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: body
-            });
+            core.info('Posted ' + posted + ' inline suggestion(s), ' + fallback + ' fallback comment(s).');
