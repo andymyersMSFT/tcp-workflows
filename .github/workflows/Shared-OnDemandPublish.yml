@@ -1,0 +1,1464 @@
+name: (On demand) Self publish
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: read
+
+on:
+    workflow_call:
+        inputs:
+            PayloadJson:
+                required: true
+                type: string
+            EnableAfterHoursPublish:
+                required: true
+                type: boolean
+            EnableServicingPublish:
+                required: false
+                type: boolean
+                default: false
+            AfterHoursAuthorizedTeam:           # GitHub team slug whose members may issue on-demand publishing commands during after hours - e.g., "windows-afterhours". Synced from CoreIdentity entitlement TCP-GHP-AfterHours-<identifier>. Leave blank to disable the after-hours scenario in this repo.
+                required: false
+                type: string
+                default: ''
+            ServicingAuthorizedTeam:            # GitHub team slug whose members may issue on-demand publishing commands at any time on enduser-servicing-* repos. Synced from CoreIdentity entitlement TCP-GHP-UrgentPublishing-<identifier>. Leave blank to disable the servicing scenario for human submitters in this repo.
+                required: false
+                type: string
+                default: ''
+            ServicingAuthorizedApps:            # Comma-separated list of GitHub app slugs authorized to issue on-demand publishing commands at any time on enduser-servicing-* repos. Apps comment as "<slug>[bot]"; this list contains just the "<slug>" portion. Leave blank to disable app submissions.
+                required: false
+                type: string
+                default: ''
+        secrets:
+            AccessToken:
+                required: true
+            PrivateKey:
+                required: true
+            ClientId:
+                required: true
+
+jobs:
+
+    on-demand-publish:
+        name: On demand self publish
+        if: |
+            github.repository_owner == 'MicrosoftDocs' &&
+            contains(github.event.repository.topics, 'build') &&
+            (
+                (github.event_name == 'issue_comment' && github.event.issue.pull_request != null) ||
+                (github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == github.event.repository.default_branch && contains(github.event.pull_request.labels.*.name, 'OnDemandPublish'))
+            )
+        runs-on: ubuntu-latest
+        steps:
+
+          - name: Create App Token
+            id: app-token
+            uses: actions/create-github-app-token@v3
+            with:
+                client-id:   ${{ secrets.ClientId }}
+                private-key: ${{ secrets.PrivateKey }}
+                owner: ${{ github.repository_owner }}
+
+          - name: Process event
+            shell: pwsh
+            env:
+                GlobalEnableAfterHoursPublish: true            # Enables or disables the after-hours scenario for all repos - true | false. EnableAfterHoursPublish on the repo also needs to be enabled.
+                GlobalEnableServicingPublish: true             # Enables or disables the servicing scenario for all enduser-servicing-* repos - true | false. EnableServicingPublish on the repo also needs to be enabled.
+                ServicingRepoPrefix: enduser-servicing-        # Servicing scenario is restricted to repos whose name starts with this prefix.
+
+                TrackingRepoOrganization: MicrosoftDocs        # Repo where tracking issues are created for PubOps to review on-demand publishing activity.
+                TrackingRepoName: tcp-mgmt-pr
+                OnDemandLabel: OnDemandPublish                 # Same label used on both caller PRs (presence triggers merge-handler AutoPublish dispatch) and tracking issues (for PubOps filtering).
+                OnDemandLabelColor: "5319E7"                   # Quoted to prevent YAML from parsing as scientific notation (5319e7 = 53190000000).
+                OnDemandLabelDescription: On-demand self publishing activity. Applied to opted-in pull requests and to tracking issues in MicrosoftDocs/tcp-mgmt-pr.
+                AutoPublishWorkflowFile: AutoPublish.yml       # Filename of the caller repo's AutoPublish workflow. Dispatched on merge or by #request-publish.
+
+                AccessToken: ${{ secrets.AccessToken }}
+                AppGitHubAccessToken: ${{ steps.app-token.outputs.token }}
+                PayloadJson: ${{ inputs.PayloadJson }}
+                EnableAfterHoursPublish: ${{ inputs.EnableAfterHoursPublish }}
+                EnableServicingPublish: ${{ inputs.EnableServicingPublish }}
+                AfterHoursAuthorizedTeam: ${{ inputs.AfterHoursAuthorizedTeam }}
+                ServicingAuthorizedTeam: ${{ inputs.ServicingAuthorizedTeam }}
+                ServicingAuthorizedApps: ${{ inputs.ServicingAuthorizedApps }}
+                IsPubOpsRepo:  ${{ contains(github.event.repository.topics, 'pubops') }}
+
+            run: |
+
+                $GitHubData = $env:PayloadJson | ConvertFrom-Json -Depth 50
+                $EnableAfterHoursPublish = [System.Convert]::ToBoolean($env:EnableAfterHoursPublish)
+                $GlobalEnableAfterHoursPublish = [System.Convert]::ToBoolean($env:GlobalEnableAfterHoursPublish)
+                $EnableServicingPublish = [System.Convert]::ToBoolean($env:EnableServicingPublish)
+                $GlobalEnableServicingPublish = [System.Convert]::ToBoolean($env:GlobalEnableServicingPublish)
+                $AccessToken = $env:AccessToken
+                $AppGitHubAccessToken = $env:AppGitHubAccessToken
+                $AfterHoursAuthorizedTeam = $env:AfterHoursAuthorizedTeam
+                $ServicingAuthorizedTeam = $env:ServicingAuthorizedTeam
+                $ServicingAuthorizedAppsRaw = $env:ServicingAuthorizedApps
+                $ServicingRepoPrefix = $env:ServicingRepoPrefix
+                $IsPubOpsRepo = [System.Convert]::ToBoolean($env:IsPubOpsRepo)
+                $TrackingRepoOrganization = $env:TrackingRepoOrganization
+                $TrackingRepoName = $env:TrackingRepoName
+                $OnDemandLabel = $env:OnDemandLabel
+                $OnDemandLabelColor = $env:OnDemandLabelColor
+                $OnDemandLabelDescription = $env:OnDemandLabelDescription
+                $AutoPublishWorkflowFile = $env:AutoPublishWorkflowFile
+
+                # Parse the comma-separated app slug list into a trimmed array. Empty or unset becomes an empty array.
+                $ServicingAuthorizedApps = @()
+                If (![string]::IsNullOrWhiteSpace($ServicingAuthorizedAppsRaw)) {
+
+                    $ServicingAuthorizedApps = $ServicingAuthorizedAppsRaw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+
+                }
+
+                # Date/Time calculations
+                $UtcNow = Get-Date -AsUTC
+                $PacificTz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Pacific Standard Time")
+                $IndiaTz = [System.TimeZoneInfo]::FindSystemTimeZoneById("India Standard Time")
+                # Convert UTC to local times
+                $PacificNow = [System.TimeZoneInfo]::ConvertTimeFromUtc($UtcNow, $PacificTz)
+                $IndiaNow = [System.TimeZoneInfo]::ConvertTimeFromUtc($UtcNow, $IndiaTz)
+                # Format as MM/DD HH:mm (24 hour clock)
+                $PacificStamp = $PacificNow.ToString('MM/dd HH:mm')
+                $IndiaStamp = $IndiaNow.ToString('MM/dd HH:mm')
+
+                # Create github HTTP authentication header
+                $StandardGitHubHeaders = @{}
+                $StandardGitHubHeaders.Add("Authorization","token $($AccessToken)")
+                $StandardGitHubHeaders.Add("User-Agent", "OfficeDocs")
+
+                # Create github HTTP authentication header using GitHub app installation token
+                $AppGitHubAccessHeaders = @{}
+                $AppGitHubAccessHeaders.Add("Authorization","token $($AppGitHubAccessToken)")
+                $AppGitHubAccessHeaders.Add("User-Agent", "OfficeDocs")
+
+                # Repo variables
+                $TargetBranch = "live"
+                $Repository = $GitHubData.event.repository.name
+                $Organization = $GitHubData.event.organization.login
+                $DefaultBranch = $GitHubData.event.repository.default_branch
+                $RepoLabelUrl = $GitHubData.event.repository.labels_url
+                $TrackingRepoLabelUrl = "https://api.github.com/repos/$TrackingRepoOrganization/$TrackingRepoName/labels{/name}"
+
+                # Is this repo eligible for the servicing scenario? Match on the configured prefix.
+                # TEMPORARY: also allow "max-cpub-test" so the bot path can be exercised end-to-end. Remove before production.
+                $IsServicingRepo = $Repository.StartsWith($ServicingRepoPrefix) -or $Repository -ieq "max-cpub-test"
+
+                # Event-driven variables. Populated from whichever event payload triggered this run.
+                $EventName = $GitHubData.event_name
+
+                If ($EventName -eq "issue_comment") {
+
+                    # PR comment event variables (source: issue_comment event)
+                    $CommentBody = $GitHubData.event.comment.body
+                    $Submitter = $GitHubData.event.comment.user.login
+                    $SubmitterType = $GitHubData.event.comment.user.type
+                    $IssueUrl = $GitHubData.event.issue.url
+                    $IssueHtmlUrl = $GitHubData.event.issue.html_url
+                    $PrNumber = $GitHubData.event.issue.number
+                    $PrTitle = $GitHubData.event.issue.title
+                    $PrApiUrl = $GitHubData.event.issue.pull_request.url
+
+                } ElseIf ($EventName -eq "pull_request") {
+
+                    # PR merge event variables (source: pull_request.closed event with merged=true)
+                    $CommentBody = $Null
+                    $Submitter = $GitHubData.event.pull_request.merged_by.login
+                    $SubmitterType = $GitHubData.event.pull_request.merged_by.type
+                    $IssueUrl = $GitHubData.event.pull_request.issue_url
+                    $IssueHtmlUrl = $GitHubData.event.pull_request.html_url
+                    $PrNumber = $GitHubData.event.pull_request.number
+                    $PrTitle = $GitHubData.event.pull_request.title
+                    $PrApiUrl = $GitHubData.event.pull_request.url
+
+                }
+
+                # Bot submitters comment as "<app-slug>[bot]" with user.type == "Bot". Strip the "[bot]" suffix for the slug lookup.
+                $IsBotSubmitter = ($SubmitterType -eq "Bot") -or ($Submitter -match '\[bot\]$')
+                $SubmitterAppSlug = If ($IsBotSubmitter) { ($Submitter -replace '\[bot\]$', '') } Else { $Null }
+
+                # @-mention prefix used in user-facing PR comments. Bots can't read mentions, so suppress for bots
+                # to keep the response cleaner. Tracking-issue body still uses "@$Submitter" verbatim (for record-keeping).
+                $MentionPrefix = If ($IsBotSubmitter) { "" } Else { "@$Submitter " }
+
+                # Command constants
+                $SelfMergeCommand = "#self-merge"
+                $RequestPublishCommand = "#request-publish"
+                $SupportedCommands = @($SelfMergeCommand, $RequestPublishCommand)
+
+                # Scenario tags. Set later based on which gating path the submitter clears.
+                $ScenarioAfterHours = "AfterHours"
+                $ScenarioServicing = "Servicing"
+
+                #####################
+                # Scenario-agnostic response messages
+
+                $WrongBaseBranchResponse = "${MentionPrefix}On-demand self publishing is only available for pull requests targeting the default branch (``$DefaultBranch``). This PR targets a different branch.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                $MergeSucceededResponse = "${MentionPrefix}We've merged this pull request. AutoPublish will be triggered automatically and changes will be published to the ``$TargetBranch`` branch shortly.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                $NotMergedResponse = "${MentionPrefix}This pull request has not been merged. The PR must be merged before a publish can be requested."
+                $AlreadyMergedResponse = "${MentionPrefix}This pull request has already been merged. Use ``$RequestPublishCommand`` to trigger a publish."
+                $PublishTriggeredResponse = "${MentionPrefix}We've triggered AutoPublish. Changes will be published to the ``$TargetBranch`` branch shortly."
+                $PublishFailedResponse = "${MentionPrefix}We couldn't trigger AutoPublish. Try again or contact PubOps.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                $AutoPublishTriggeredOnMergeResponse = "This pull request has merged. We've triggered AutoPublish automatically. Changes will be published to the ``$TargetBranch`` branch shortly."
+                $AutoPublishFailedOnMergeResponse = "This pull request has merged but we couldn't trigger AutoPublish automatically. Use ``$RequestPublishCommand`` on this PR to retry, or wait for the next scheduled publish run.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+
+                #####################
+                # After-hours scenario response messages
+
+                $AfterHours_StandardHoursResponse = "${MentionPrefix}After hours self publishing isn't available during standard publishing hours. Add the **Sign off** label to request publishing from PubOps.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                $AfterHours_UnauthorizedHeader = "Only authorized submitters can use after hours self publishing commands."
+
+                #####################
+                # Servicing scenario response messages
+
+                $Servicing_UnauthorizedHeader = "Only authorized submitters can use servicing self publishing commands."
+
+                #####################
+                #####################
+                # Get-NthWeekday
+
+                Function Get-NthWeekday {
+
+                    [CmdletBinding()]
+                    param(
+
+                        [int]$Year,
+                        [int]$Month,
+                        [int]$N,
+                        [DayOfWeek]$DayOfWeek
+
+                    )
+
+                    $FirstOfMonth = Get-Date -Year $Year -Month $Month -Day 1
+                    $Offset = (([int]$DayOfWeek - [int]$FirstOfMonth.DayOfWeek) + 7) % 7
+                    $FirstInstance = $FirstOfMonth.AddDays($Offset)
+
+                    Return $FirstInstance.AddDays(($N - 1) * 7)
+
+                }
+
+                #####################
+                #####################
+                # Get-LastWeekday
+
+                Function Get-LastWeekday {
+
+                    [CmdletBinding()]
+                    param(
+
+                        [int]$Year,
+                        [int]$Month,
+                        [DayOfWeek]$DayOfWeek
+
+                    )
+
+                    $LastDayOfMonth = [DateTime]::DaysInMonth($Year, $Month)
+                    $LastDate = Get-Date -Year $Year -Month $Month -Day $LastDayOfMonth
+                    $Offset = (([int]$LastDate.DayOfWeek - [int]$DayOfWeek) + 7) % 7
+
+                    Return $LastDate.AddDays(-$Offset)
+
+                }
+
+                #####################
+                #####################
+                # Get-MicrosoftUsHolidays
+
+                # Microsoft-observed US holidays (all-day in Pacific time). Weekend-adjacent observance not applied - if a holiday
+                # falls on Saturday or Sunday it's already within the after hours window anyway.
+                Function Get-MicrosoftUsHolidays {
+
+                    [CmdletBinding()]
+                    param(
+
+                        [int]$Year
+
+                    )
+
+                    $Holidays = @()
+
+                    # New Year's Day
+                    $Holidays += (Get-Date -Year $Year -Month 1 -Day 1).Date
+                    # MLK Day (3rd Monday of January)
+                    $Holidays += (Get-NthWeekday -Year $Year -Month 1 -N 3 -DayOfWeek Monday).Date
+                    # Presidents Day (3rd Monday of February)
+                    $Holidays += (Get-NthWeekday -Year $Year -Month 2 -N 3 -DayOfWeek Monday).Date
+                    # Memorial Day (last Monday of May)
+                    $Holidays += (Get-LastWeekday -Year $Year -Month 5 -DayOfWeek Monday).Date
+                    # Independence Day
+                    $Holidays += (Get-Date -Year $Year -Month 7 -Day 4).Date
+                    # Labor Day (1st Monday of September)
+                    $Holidays += (Get-NthWeekday -Year $Year -Month 9 -N 1 -DayOfWeek Monday).Date
+                    # Thanksgiving (4th Thursday of November)
+                    $Thanksgiving = (Get-NthWeekday -Year $Year -Month 11 -N 4 -DayOfWeek Thursday).Date
+                    $Holidays += $Thanksgiving
+                    # Day after Thanksgiving
+                    $Holidays += $Thanksgiving.AddDays(1)
+                    # Christmas Eve
+                    $Holidays += (Get-Date -Year $Year -Month 12 -Day 24).Date
+                    # Christmas Day
+                    $Holidays += (Get-Date -Year $Year -Month 12 -Day 25).Date
+
+                    Return $Holidays
+
+                }
+
+                #####################
+                #####################
+                # Test-AfterHours
+
+                # After hours are: Friday 5:00pm PT to Sunday 4:30pm PT, plus any Microsoft-observed US holiday (full day, PT).
+                Function Test-AfterHours {
+
+                    # Any part of the Pacific day being a holiday marks the whole day after hours.
+                    $Holidays = Get-MicrosoftUsHolidays -Year $PacificNow.Year
+                    $PacificDate = $PacificNow.Date
+
+                    If ($Holidays -contains $PacificDate) {
+
+                        Write-Host "Pacific date $($PacificDate.ToString('yyyy-MM-dd')) is a Microsoft US holiday. After hours active."
+
+                        Return $True
+
+                    }
+
+                    $DayOfWeek = $PacificNow.DayOfWeek
+                    $Hour = $PacificNow.Hour
+                    $Minute = $PacificNow.Minute
+
+                    # Saturday is fully inside the after hours window.
+                    If ($DayOfWeek -eq [DayOfWeek]::Saturday) {
+
+                        Return $True
+
+                    }
+
+                    # Friday 17:00 PT or later.
+                    If ($DayOfWeek -eq [DayOfWeek]::Friday -and $Hour -ge 17) {
+
+                        Return $True
+
+                    }
+
+                    # Sunday before 16:30 PT.
+                    If ($DayOfWeek -eq [DayOfWeek]::Sunday -and ($Hour -lt 16 -or ($Hour -eq 16 -and $Minute -lt 30))) {
+
+                        Return $True
+
+                    }
+
+                    Return $False
+
+                }
+
+                #####################
+                #####################
+                # Test-AuthorizedSubmitter
+
+                # Returns $True if $Submitter is an active member of the given team. Returns $False if the team is empty/unset,
+                # the membership lookup fails, or the user is not an active member.
+                Function Test-AuthorizedSubmitter {
+
+                    [CmdletBinding()]
+                    param(
+
+                        $Submitter,
+                        $Team
+
+                    )
+
+                    If ([string]::IsNullOrWhiteSpace($Team)) {
+
+                        Return $False
+
+                    }
+
+                    $MembershipUri = "https://api.github.com/orgs/$Organization/teams/$Team/memberships/$Submitter"
+
+                    Try {
+
+                        Write-Host "Checking if $Submitter is an active member of team $Organization/$Team."
+
+                        $Response = Invoke-RestMethod -Uri $MembershipUri -Headers $AppGitHubAccessHeaders -Method Get -ErrorAction Stop
+
+                        If ($Response.state -eq "active") {
+
+                            Write-Host "$Submitter is an active member of team $Organization/$Team."
+
+                            Return $True
+
+                        } Else {
+
+                            Write-Host "$Submitter membership on team $Organization/$Team is `"$($Response.state)`"."
+
+                            Return $False
+
+                        }
+
+                    } Catch {
+
+                        Write-Host "$Submitter is not a member of team $Organization/$Team, or the lookup failed. Error: $($Error[0].Exception.Message)."
+
+                        Return $False
+
+                    }
+
+                }
+
+                #####################
+                #####################
+                # Test-AuthorizedApp
+
+                # Returns $True if the bot submitter's app slug appears in the authorized apps list. Case-insensitive match.
+                Function Test-AuthorizedApp {
+
+                    [CmdletBinding()]
+                    param(
+
+                        $AppSlug,
+                        $AuthorizedApps
+
+                    )
+
+                    If ([string]::IsNullOrWhiteSpace($AppSlug)) {
+
+                        Return $False
+
+                    }
+
+                    If ($Null -eq $AuthorizedApps -or $AuthorizedApps.Count -eq 0) {
+
+                        Return $False
+
+                    }
+
+                    ForEach ($Allowed in $AuthorizedApps) {
+
+                        If ($AppSlug -ieq $Allowed) {
+
+                            Write-Host "App slug `"$AppSlug`" matches authorized app `"$Allowed`"."
+
+                            Return $True
+
+                        }
+
+                    }
+
+                    Write-Host "App slug `"$AppSlug`" is not in the authorized apps list."
+
+                    Return $False
+
+                }
+
+                #####################
+                #####################
+                # Get-TeamMembers
+
+                # Returns a sorted array of login strings for active members of the given team. Used to build the unauthorized
+                # rejection message so the rejected submitter can see who is currently authorized. Cross-org so use App token.
+                # Returns $null if the API call fails (so the caller can distinguish "lookup failed" from "team is empty").
+                Function Get-TeamMembers {
+
+                    [CmdletBinding()]
+                    param(
+
+                        $Team
+
+                    )
+
+                    If ([string]::IsNullOrWhiteSpace($Team)) {
+
+                        Return [PSCustomObject]@{ Status = "Unset"; Members = @() }
+
+                    }
+
+                    $MembersUri = "https://api.github.com/orgs/$Organization/teams/$Team/members?per_page=100"
+
+                    Try {
+
+                        Write-Host "Listing members of team $Organization/$Team."
+
+                        $Response = Invoke-RestMethod -Uri $MembersUri -Headers $AppGitHubAccessHeaders -Method Get -FollowRelLink -ErrorAction Stop
+
+                        # -FollowRelLink returns an array per page when pagination is in play, or a single page directly. Flatten then project to logins.
+                        $Members = @($Response | ForEach-Object { $_ } | Where-Object { $_.login } | Select-Object -ExpandProperty login | Sort-Object)
+
+                        Return [PSCustomObject]@{ Status = "Found"; Members = $Members }
+
+                    } Catch {
+
+                        # Distinguish "team doesn't exist" (404) from other failures so the unauthorized message can say so accurately.
+                        $StatusCode = $Null
+                        If ($_.Exception.Response) { $StatusCode = [int]$_.Exception.Response.StatusCode }
+                        If ($StatusCode -eq 404) {
+                            Write-Host "Team $Organization/$Team not found (404)."
+                            Return [PSCustomObject]@{ Status = "NotFound"; Members = @() }
+                        }
+                        Write-Host "ERROR: Failed to list members of team $Organization/$Team. HTTP $StatusCode. Error: $($_.Exception.Message)."
+                        Return [PSCustomObject]@{ Status = "Error"; Members = @() }
+
+                    }
+
+                }
+
+                #####################
+                #####################
+                # Format-MemberSection
+
+                # Renders one labeled section of the unauthorized response. Returns an empty string when the team isn't
+                # configured (caller answer: omit empty sections entirely).
+                Function Format-MemberSection {
+
+                    [CmdletBinding()]
+                    param(
+
+                        [string]$SectionLabel,
+                        [string]$Team
+
+                    )
+
+                    If ([string]::IsNullOrWhiteSpace($Team)) {
+
+                        Return ""
+
+                    }
+
+                    $Result = Get-TeamMembers -Team $Team
+
+                    $Body = Switch ($Result.Status) {
+                        "Found"    { If ($Result.Members.Count -eq 0) { "_(no GitHub accounts are currently authorized)_" } Else { ($Result.Members | ForEach-Object { "- ``$_``" }) -join "`n" } }
+                        "NotFound" { "_(team ``$Team`` does not exist - check the workflow-config.json entry)_" }
+                        "Error"    { "_(unable to retrieve the list of authorized GitHub accounts)_" }
+                        Default    { "_(unable to retrieve the list of authorized GitHub accounts)_" }
+                    }
+
+                    Return "**$SectionLabel**`n$Body"
+
+                }
+
+                #####################
+                #####################
+                # Format-AppsSection
+
+                # Renders the authorized-apps section. Returns an empty string when no apps are configured.
+                Function Format-AppsSection {
+
+                    [CmdletBinding()]
+                    param(
+
+                        [string]$SectionLabel,
+                        $AuthorizedApps
+
+                    )
+
+                    If ($Null -eq $AuthorizedApps -or $AuthorizedApps.Count -eq 0) {
+
+                        Return ""
+
+                    }
+
+                    $Body = ($AuthorizedApps | ForEach-Object { "- ``$_[bot]``" }) -join "`n"
+
+                    Return "**$SectionLabel**`n$Body"
+
+                }
+
+                #####################
+                #####################
+                # Get-PrCommand
+
+                # Commands must start at the beginning of a line and must be the only content on that line. Other lines are ignored.
+                # First matching command wins if multiple are present.
+                Function Get-PrCommand {
+
+                    [CmdletBinding()]
+                    param(
+
+                        $CommentBody
+
+                    )
+
+                    $FoundCommand = $Null
+
+                    ForEach ($Line in ($CommentBody -split "`r?`n")) {
+
+                        # Trim trailing whitespace only. Leading whitespace disqualifies per spec ("must start on the beginning of a line").
+                        $Candidate = $Line.TrimEnd()
+
+                        If ($SupportedCommands -contains $Candidate) {
+
+                            $FoundCommand = $Candidate
+                            Break
+
+                        }
+
+                    }
+
+                    Return $FoundCommand
+
+                }
+
+                #####################
+                #####################
+                # Add-PrComment
+
+                Function Add-PrComment {
+
+                    [CmdletBinding()]
+                    param(
+
+                        $IssueUrl,
+                        $Body
+
+                    )
+
+                    $CommentUri = "$IssueUrl/comments"
+                    $RequestBody = @{ body = $Body } | ConvertTo-Json
+
+                    Try {
+
+                        Write-Host "Adding comment to $CommentUri."
+
+                        $Result = Invoke-RestMethod -Uri $CommentUri -Headers $AppGitHubAccessHeaders -Body $RequestBody -Method POST -ErrorAction Stop
+
+                    } Catch {
+
+                        Write-Host "ERROR: Failed to add comment to $CommentUri. Error: $($Error[0].Exception.Message)."
+
+                    }
+
+                }
+
+                #####################
+                #####################
+                # Set-PrLabel
+
+                Function Set-PrLabel {
+
+                    param(
+
+                        $IssueUrl,
+                        $LabelName
+
+                    )
+
+                    # Construct label URL based on issue or pull request URL
+                    $IssueLabelUrl = "$IssueUrl/labels"
+
+                    # Construct JSON statement that will be sent to GitHub as the body of the web request. Includes only the label name. GitHub expects an array even thought it's a single value
+                    # Convert array to JSON
+                    $Body = @()
+                    $Body += $LabelName
+                    $Body = ConvertTo-Json -InputObject $Body
+
+                    # Try to submit the request to GitHub API to apply they label to the issue or pull request
+                    Try {
+
+                        Write-Host "Setting label $LabelName on URL $IssueLabelUrl."
+
+                        $Result = Invoke-RestMethod -Uri $IssueLabelUrl -Body $Body -Headers $StandardGitHubHeaders  -Method POST
+
+
+                    } Catch {
+
+                        Write-Host "ERROR: Failed to set label on URL $IssueLabelUrl. Error: $($Error[0].Exception.Message)."
+
+                    }
+
+                }
+
+                #####################
+                #####################
+                # Test-RepoLabel
+
+                Function Test-RepoLabel {
+
+                    [CmdletBinding()]
+                    param(
+
+                        $Name,
+                        $RepoUri,
+                        $Headers = $StandardGitHubHeaders
+                    )
+
+                    # Replace placeholder text in the URL retrieved from the GitHub API with the name of the label we're looking for
+                    $LabelUri = $RepoUri.Replace("{/name}","/$Name")
+
+                    # Check to see if the label we want exists in the repo
+                    Try {
+
+                        Write-Host "Checking to see if label $Name exists in repo URL $LabelUri."
+
+                        $LabelResults = Invoke-WebRequest -UseBasicParsing -Uri $LabelUri -Headers $Headers  -ErrorAction Stop
+                        $LabelFound = $True
+
+                    } Catch {
+
+                        # 404 is expected when the label doesn't exist. Other status codes indicate a real problem
+                        # (auth, network, etc.) - log the reason so we can tell apart "missing" from "couldn't check".
+                        $StatusCode = $Null
+                        If ($_.Exception.Response) { $StatusCode = [int]$_.Exception.Response.StatusCode }
+                        If ($StatusCode -eq 404) {
+                            Write-Host "Label $Name not found (404). It will be created."
+                        } Else {
+                            Write-Host "WARNING: Label-existence check for $Name returned an unexpected error. HTTP $StatusCode. Error: $($_.Exception.Message)."
+                        }
+                        $LabelFound = $False
+
+                    }
+
+                    # Return boolean to calling statement
+                    $LabelFound
+
+                }
+
+                #####################
+                #####################
+                # New-RepoLabel
+
+                Function New-RepoLabel {
+
+                    [CmdletBinding()]
+                    param(
+
+                        $Name,
+                        $Color,
+                        $Description,
+                        $RepoUri,
+                        $Headers = $StandardGitHubHeaders
+                    )
+
+                    # Remove placeholder text from repo URL
+                    $RepoUri = $RepoUri.Replace("{/name}","")
+                    $Result = $Null
+
+                    # Construct the JSON statement that will be sent to GitHub as the body of the web request. Include the name of the label, its color, and description.
+                    # Convert hash table to JSON
+                    $Body = @{}
+                    $Body.Add("name", $Name)
+                    $Body.Add("color", $Color)
+                    $Body.Add("description", $description)
+                    $Body = $Body | ConvertTo-Json
+
+                    # Try to submit the request to GitHub API to create the label
+                    Try {
+
+                        Write-Host "Creating label $Name with color $Color on repo $RepoUri."
+
+                        $Result = Invoke-RestMethod -Uri $RepoUri -Headers $Headers  -Body $Body -Method POST
+
+                    } Catch {
+
+                        # 422 from labels-create means the label already exists. Treat that as success; everything else is a real error.
+                        $StatusCode = $Null
+                        If ($_.Exception.Response) { $StatusCode = [int]$_.Exception.Response.StatusCode }
+                        If ($StatusCode -eq 422) {
+                            Write-Host "Label $Name already exists on $RepoUri. Skipping create."
+                        } Else {
+                            Write-Host "ERROR: Failed to create new label $Name on repo $RepoUri. HTTP $StatusCode. Error: $($_.Exception.Message)."
+                        }
+
+                    }
+
+                }
+
+                #####################
+                #####################
+                # Get-TzAbbrev
+
+                # Derive a 2- or 3-letter abbreviation from the zone's name
+                Function Get-TzAbbrev {
+                    param(
+                        [System.TimeZoneInfo]$Tz,
+                        [DateTime]$LocalTime
+                    )
+                    # Choose the right long name (standard vs. daylight)
+                    $FullName = If ($Tz.IsDaylightSavingTime($LocalTime)) {
+                        $Tz.DaylightName     # e.g. "Pacific Daylight Time"
+                    } Else {
+                        $Tz.StandardName     # e.g. "Pacific Standard Time"
+                    }
+
+                    # Collapse it to initials: "Pacific Daylight Time" to "PDT"
+                    -Join (($fullName -split '\s+') | ForEach-Object { $_[0] })
+                }
+
+                #####################
+                #####################
+                # Merge-PullRequest
+
+                # Merges a PR directly via the REST API using the App token. Used by the #self-merge command after status
+                # checks have been verified as passing. The partner doesn't have direct merge permission; the App token does.
+                Function Merge-PullRequest {
+
+                    [CmdletBinding()]
+                    param(
+
+                        [Parameter(Mandatory)]
+                        [int]$PullNumber,
+                        [string]$MergeMethod = "squash"
+
+                    )
+
+                    $MergeUri = "https://api.github.com/repos/$Organization/$Repository/pulls/$PullNumber/merge"
+                    $Body = @{ merge_method = $MergeMethod } | ConvertTo-Json
+
+                    $Result = [PSCustomObject]@{
+                        Success = $False
+                        Response = $Null
+                        ErrorMessage = $Null
+                    }
+
+                    Try {
+
+                        Write-Host "Merging PR #$PullNumber directly via API. Method: $MergeMethod."
+
+                        $Result.Response = Invoke-RestMethod -Uri $MergeUri -Headers $AppGitHubAccessHeaders -Body $Body -Method PUT -ErrorAction Stop
+                        $Result.Success = $True
+
+                        Write-Host "PR #$PullNumber merged. SHA: $($Result.Response.sha)."
+
+                    } Catch {
+
+                        # PowerShell's default exception message just gives the HTTP status (e.g. "405 (Method Not Allowed)"),
+                        # which doesn't tell us why GitHub refused the merge. The response body has the real reason - extract it.
+                        $StatusCode = $Null
+                        If ($_.Exception.Response) { $StatusCode = [int]$_.Exception.Response.StatusCode }
+
+                        $GithubMessage = $Null
+                        If ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                            Try {
+                                $Parsed = $_.ErrorDetails.Message | ConvertFrom-Json
+                                $GithubMessage = $Parsed.message
+                                If ($Parsed.documentation_url) { $GithubMessage += " (see $($Parsed.documentation_url))" }
+                            } Catch {
+                                $GithubMessage = $_.ErrorDetails.Message
+                            }
+                        }
+
+                        $Result.ErrorMessage = If ($GithubMessage) {
+                            "HTTP $StatusCode - $GithubMessage"
+                        } Else {
+                            $_.Exception.Message
+                        }
+
+                        Write-Host "ERROR: Failed to merge PR #$PullNumber directly. $($Result.ErrorMessage)."
+
+                    }
+
+                    Return $Result
+
+                }
+
+                #####################
+                #####################
+                # Get-TrackingIssue
+
+                # Searches the tracking repo for an existing open issue that references this PR. Title marker is unique per PR.
+                Function Get-TrackingIssue {
+
+                    param(
+
+                        [string]$TitleMarker
+
+                    )
+
+                    # List open issues on the tracking repo filtered by the tracking label, then match the title marker in code.
+                    # Avoids GitHub Search API's phrase limitations (rejects "[", "/", "#" in title phrases). Cross-repo so use App token.
+                    $ListUri = "https://api.github.com/repos/$TrackingRepoOrganization/$TrackingRepoName/issues?labels=$OnDemandLabel&state=open&per_page=100"
+
+                    Try {
+
+                        Write-Host "Listing open tracking issues in $TrackingRepoOrganization/$TrackingRepoName for marker `"$TitleMarker`"."
+
+                        $Response = Invoke-RestMethod -Uri $ListUri -Headers $AppGitHubAccessHeaders -Method Get -FollowRelLink -ErrorAction Stop
+
+                        # -FollowRelLink returns one array per page. Flatten and filter to those whose title begins with the marker.
+                        $Match = $Response | ForEach-Object { $_ } | Where-Object { $_.title -and $_.title.StartsWith($TitleMarker) } | Select-Object -First 1
+
+                        If ($Match) {
+
+                            Return $Match
+
+                        }
+
+                    } Catch {
+
+                        Write-Host "ERROR: Failed to list tracking issues. Error: $($Error[0].Exception.Message)."
+
+                    }
+
+                    Return $Null
+
+                }
+
+                #####################
+                #####################
+                # New-TrackingIssue
+
+                Function New-TrackingIssue {
+
+                    param(
+
+                        [string]$TitleMarker,
+                        [string]$Action,
+                        [string]$Scenario
+
+                    )
+
+                    # Ensure the tracking label exists on the tracking repo before assigning it. Cross-repo so route through the App token;
+                    # the caller's GITHUB_TOKEN is scoped to the caller repo and cannot read/write labels on the tracking repo.
+                    $LabelExists = Test-RepoLabel -RepoUri $TrackingRepoLabelUrl -Name $OnDemandLabel -Headers $AppGitHubAccessHeaders
+
+                    If (!$LabelExists) {
+
+                        New-RepoLabel -RepoUri $TrackingRepoLabelUrl -Name $OnDemandLabel -Color $OnDemandLabelColor -Description $OnDemandLabelDescription -Headers $AppGitHubAccessHeaders
+
+                    }
+
+                    $IssueTitle = "$TitleMarker - $PrTitle"
+                    $IssueBody = "An on-demand publishing command was submitted on a pull request. PubOps should review the changes in the PR against PR criteria and close this issue once any required fixes are resolved.`n`n" +
+                                 "- **Scenario**: $Scenario`n" +
+                                 "- **Repo**: ``$Organization/$Repository```n" +
+                                 "- **Pull request**: $IssueHtmlUrl`n" +
+                                 "- **Submitter**: @$Submitter`n" +
+                                 "- **Initial action**: $Action`n" +
+                                 "- **Submitted**: $PacificStamp $(Get-TzAbbrev $PacificTz $PacificNow) | $IndiaStamp $(Get-TzAbbrev $IndiaTz $IndiaNow)`n" +
+                                 "- **PubOps repo**: $IsPubOpsRepo`n`n" +
+                                 "If any changes don't meet PR criteria, PubOps will attempt to fix them if there's no impact to the meaning of the content. If PubOps can't fix the issue, they'll reach out to the submitter to resolve it.`n`n" +
+                                 "If you have questions, post a message to https://aka.ms/tcphelp."
+
+                    $Body = @{
+                        title = $IssueTitle
+                        body = $IssueBody
+                        labels = @($OnDemandLabel)
+                    } | ConvertTo-Json
+
+                    $CreateUri = "https://api.github.com/repos/$TrackingRepoOrganization/$TrackingRepoName/issues"
+
+                    Try {
+
+                        Write-Host "Creating tracking issue `"$IssueTitle`" in $TrackingRepoOrganization/$TrackingRepoName."
+
+                        $Result = Invoke-RestMethod -Uri $CreateUri -Headers $AppGitHubAccessHeaders -Body $Body -Method POST -ErrorAction Stop
+
+                        Write-Host "Created tracking issue $($Result.html_url)."
+
+                        Return $Result
+
+                    } Catch {
+
+                        Write-Host "ERROR: Failed to create tracking issue. Error: $($Error[0].Exception.Message)."
+
+                        Return $Null
+
+                    }
+
+                }
+
+                #####################
+                #####################
+                # Update-TrackingIssue
+
+                Function Update-TrackingIssue {
+
+                    param(
+
+                        [string]$TrackingIssueUrl,
+                        [string]$Action,
+                        [string]$Scenario,
+                        [string]$SubmitterOverride
+
+                    )
+
+                    # The merge handler passes SubmitterOverride to credit the original #self-merge submitter
+                    # rather than the App that actually executed the merge.
+                    $EffectiveSubmitter = If ([string]::IsNullOrWhiteSpace($SubmitterOverride)) { $Submitter } Else { $SubmitterOverride }
+
+                    $CommentBody = "- **Action**: $Action`n" +
+                                   "- **Scenario**: $Scenario`n" +
+                                   "- **Submitter**: @$EffectiveSubmitter`n" +
+                                   "- **Submitted**: $PacificStamp $(Get-TzAbbrev $PacificTz $PacificNow) | $IndiaStamp $(Get-TzAbbrev $IndiaTz $IndiaNow)"
+
+                    $Body = @{ body = $CommentBody } | ConvertTo-Json
+                    $CommentUri = "$TrackingIssueUrl/comments"
+
+                    Try {
+
+                        Write-Host "Updating tracking issue at $TrackingIssueUrl."
+
+                        $Result = Invoke-RestMethod -Uri $CommentUri -Headers $AppGitHubAccessHeaders -Body $Body -Method POST -ErrorAction Stop
+
+                    } Catch {
+
+                        Write-Host "ERROR: Failed to update tracking issue $TrackingIssueUrl. Error: $($Error[0].Exception.Message)."
+
+                    }
+
+                }
+
+                #####################
+                #####################
+                # Record-TrackingActivity
+
+                # Creates the tracking issue if none exists for this PR, otherwise appends a comment. PubOps uses these issues to
+                # monitor usage of on-demand publishing and to review submitted PRs.
+                Function Record-TrackingActivity {
+
+                    param(
+
+                        [string]$Action,
+                        [string]$Scenario
+
+                    )
+
+                    $TitleMarker = "[OnDemandPublish] $Organization/$Repository#$PrNumber"
+                    $TrackingIssue = Get-TrackingIssue -TitleMarker $TitleMarker
+
+                    If ($TrackingIssue) {
+
+                        Write-Host "Existing tracking issue found: $($TrackingIssue.html_url)."
+
+                        Update-TrackingIssue -TrackingIssueUrl $TrackingIssue.url -Action $Action -Scenario $Scenario
+
+                    } Else {
+
+                        Write-Host "No existing tracking issue. Creating a new one."
+
+                        New-TrackingIssue -TitleMarker $TitleMarker -Action $Action -Scenario $Scenario | Out-Null
+
+                    }
+
+                }
+
+                #####################
+                #####################
+                # Invoke-AutoPublish
+
+                # Triggers the caller repo's AutoPublish workflow via workflow_dispatch. The caller workflow must declare
+                # workflow_dispatch in its `on:` block for this to succeed.
+                Function Invoke-AutoPublish {
+
+                    $DispatchUri = "https://api.github.com/repos/$Organization/$Repository/actions/workflows/$AutoPublishWorkflowFile/dispatches"
+                    $Body = @{ ref = $DefaultBranch } | ConvertTo-Json
+
+                    Try {
+
+                        Write-Host "Triggering AutoPublish workflow `"$AutoPublishWorkflowFile`" in $Organization/$Repository on ref $DefaultBranch."
+
+                        $Result = Invoke-RestMethod -Uri $DispatchUri -Headers $AppGitHubAccessHeaders -Body $Body -Method POST -ErrorAction Stop
+
+                        Return $True
+
+                    } Catch {
+
+                        Write-Host "ERROR: Failed to trigger AutoPublish workflow. Error: $($Error[0].Exception.Message)."
+
+                        Return $False
+
+                    }
+
+                }
+
+                #####################
+                #####################
+                # Build-UnauthorizedResponse
+
+                # Builds the unauthorized rejection message. Lists the configured team(s) the submitter could request access to,
+                # tailored to which scenario(s) apply on this repo. Empty/unconfigured sections are omitted entirely.
+                Function Build-UnauthorizedResponse {
+
+                    [CmdletBinding()]
+                    param(
+
+                        [string]$ScenarioInContext
+
+                    )
+
+                    # Determine which sections to show based on the scenario context:
+                    # - On an enduser-servicing-* repo with both scenarios applicable: show both labeled sections.
+                    # - Otherwise: show only the section(s) relevant to the applicable scenario.
+
+                    $Sections = @()
+                    $Header = ""
+
+                    If ($ScenarioInContext -eq $ScenarioServicing) {
+
+                        $Header = $Servicing_UnauthorizedHeader
+
+                        $AhSection = Format-MemberSection -SectionLabel "After-hours authorized accounts:" -Team $AfterHoursAuthorizedTeam
+                        $SvcSection = Format-MemberSection -SectionLabel "Servicing authorized accounts:" -Team $ServicingAuthorizedTeam
+                        $AppsSection = Format-AppsSection -SectionLabel "Servicing authorized apps:" -AuthorizedApps $ServicingAuthorizedApps
+
+                        If ($AhSection) { $Sections += $AhSection }
+                        If ($SvcSection) { $Sections += $SvcSection }
+                        If ($AppsSection) { $Sections += $AppsSection }
+
+                    } Else {
+
+                        # AfterHours scenario context (or no scenario - default to after-hours framing for non-servicing repos).
+                        $Header = $AfterHours_UnauthorizedHeader
+
+                        $AhSection = Format-MemberSection -SectionLabel "After-hours authorized accounts:" -Team $AfterHoursAuthorizedTeam
+
+                        If ($AhSection) { $Sections += $AhSection }
+
+                    }
+
+                    $SectionsBlock = If ($Sections.Count -gt 0) { ($Sections -join "`n`n") } Else { "_(no authorized submitters are currently configured)_" }
+
+                    Return "${MentionPrefix}$Header`n`n$SectionsBlock`n`nAuthorized submitters are managed via CoreIdentity entitlements.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+
+                }
+
+                #####################
+                #####################
+                # Main
+
+                # Master gate: at least one scenario must be enabled globally + locally to proceed.
+                $AfterHoursEnabled = $GlobalEnableAfterHoursPublish -and $EnableAfterHoursPublish
+                $ServicingEnabled = $GlobalEnableServicingPublish -and $EnableServicingPublish -and $IsServicingRepo
+
+                If (!$AfterHoursEnabled -and !$ServicingEnabled) {
+
+                    Write-Host "On-demand publishing is disabled for this repo. GlobalEnableAfterHoursPublish: $GlobalEnableAfterHoursPublish. EnableAfterHoursPublish: $EnableAfterHoursPublish. GlobalEnableServicingPublish: $GlobalEnableServicingPublish. EnableServicingPublish: $EnableServicingPublish. IsServicingRepo: $IsServicingRepo. Exiting."
+
+                    Return
+
+                }
+
+                Write-Host "Event: $EventName. PR #$PrNumber ($Organization/$Repository). AfterHoursEnabled: $AfterHoursEnabled. ServicingEnabled: $ServicingEnabled. IsServicingRepo: $IsServicingRepo. IsBotSubmitter: $IsBotSubmitter."
+
+                #####################
+                # Merge handler
+
+                # Fires on pull_request.closed with merged=true and the OnDemandPublish label present. The job-level `if:`
+                # already verified those preconditions, so no further gates are required - the partner's intent was captured
+                # at #self-merge time. Auto-trigger AutoPublish so the merged content publishes without the partner having to
+                # come back and run #request-publish manually. #request-publish remains as a fallback if this auto-trigger fails.
+                If ($EventName -eq "pull_request") {
+
+                    # Look up the existing tracking issue (created at #self-merge time) and recover the original
+                    # scenario + submitter from its body. Falls back to "Unknown" / merged_by if no issue exists
+                    # (e.g. manual-label edge case where the PR never went through #self-merge).
+                    $TitleMarker = "[OnDemandPublish] $Organization/$Repository#$PrNumber"
+                    $ExistingTrackingIssue = Get-TrackingIssue -TitleMarker $TitleMarker
+
+                    $MergeScenario = "Unknown"
+                    $OriginalSubmitter = $Submitter
+
+                    If ($ExistingTrackingIssue -and $ExistingTrackingIssue.body) {
+                        If ($ExistingTrackingIssue.body -match '(?m)^- \*\*Scenario\*\*:\s*(\S+)') { $MergeScenario = $Matches[1] }
+                        If ($ExistingTrackingIssue.body -match '(?m)^- \*\*Submitter\*\*:\s*@([^\s]+)') { $OriginalSubmitter = $Matches[1] }
+                        Write-Host "Recovered from existing tracking issue: Scenario=$MergeScenario, Submitter=$OriginalSubmitter."
+                    } Else {
+                        Write-Host "No existing tracking issue for PR #$PrNumber. Using Scenario=Unknown, Submitter=$Submitter (merged_by)."
+                    }
+
+                    Write-Host "Self-merge PR #$PrNumber has merged. Triggering AutoPublish workflow."
+
+                    $Triggered = Invoke-AutoPublish
+
+                    If ($Triggered) {
+
+                        Add-PrComment -IssueUrl $IssueUrl -Body $AutoPublishTriggeredOnMergeResponse
+                        $ActionTaken = "PR merged. AutoPublish triggered automatically."
+
+                    } Else {
+
+                        Add-PrComment -IssueUrl $IssueUrl -Body $AutoPublishFailedOnMergeResponse
+                        $ActionTaken = "PR merged. Failed to trigger AutoPublish automatically. Use ``$RequestPublishCommand`` to retry."
+
+                    }
+
+                    If ($ExistingTrackingIssue) {
+
+                        Update-TrackingIssue -TrackingIssueUrl $ExistingTrackingIssue.url -Action $ActionTaken -Scenario $MergeScenario -SubmitterOverride $OriginalSubmitter
+
+                    } Else {
+
+                        New-TrackingIssue -TitleMarker $TitleMarker -Action $ActionTaken -Scenario $MergeScenario | Out-Null
+
+                    }
+
+                    Return
+
+                }
+
+                #####################
+                # Command handler
+
+                # Parse the command from the comment. Exit silently if no supported command is present - comments without commands
+                # are ordinary PR conversation and shouldn't trigger the workflow's response path.
+                $Command = Get-PrCommand -CommentBody $CommentBody
+
+                If (!$Command) {
+
+                    Write-Host "No supported on-demand publishing command found in comment. Exiting."
+
+                    Return
+
+                }
+
+                Write-Host "Command `"$Command`" detected from $Submitter on PR #$PrNumber ($Organization/$Repository)."
+
+                #####################
+                # Scenario selection
+                #
+                # Determine which scenario applies to this submitter, in this order:
+                #   1. Servicing (more permissive: any time, any day). Wins for bots and for users in the ServicingAuthorizedTeam
+                #      on enduser-servicing-* repos.
+                #   2. AfterHours (legacy). Applies to humans in the AfterHoursAuthorizedTeam during the after-hours window.
+                # Bots can only ever use the servicing scenario.
+
+                $ServicingAuthorized = $False
+                $AfterHoursAuthorized = $False
+
+                If ($ServicingEnabled) {
+
+                    If ($IsBotSubmitter) {
+
+                        $ServicingAuthorized = Test-AuthorizedApp -AppSlug $SubmitterAppSlug -AuthorizedApps $ServicingAuthorizedApps
+
+                    } Else {
+
+                        $ServicingAuthorized = Test-AuthorizedSubmitter -Submitter $Submitter -Team $ServicingAuthorizedTeam
+
+                    }
+
+                }
+
+                If ($AfterHoursEnabled -and !$IsBotSubmitter) {
+
+                    $AfterHoursAuthorized = Test-AuthorizedSubmitter -Submitter $Submitter -Team $AfterHoursAuthorizedTeam
+
+                }
+
+                # Scenario precedence: Servicing wins (more permissive) when authorized via the servicing path.
+                $Scenario = If ($ServicingAuthorized) {
+                    $ScenarioServicing
+                } ElseIf ($AfterHoursAuthorized) {
+                    $ScenarioAfterHours
+                } Else {
+                    $Null
+                }
+
+                Write-Host "Scenario selection - ServicingAuthorized: $ServicingAuthorized. AfterHoursAuthorized: $AfterHoursAuthorized. Selected scenario: $Scenario."
+
+                # Build the unauthorized response if no scenario applies. Use the most relevant scenario context for the message:
+                # on a servicing-eligible repo, show all configured options; elsewhere show after-hours only.
+                If ($Null -eq $Scenario) {
+
+                    # Bots that don't authorize via servicing should not get spammy rejection comments. Exit silently.
+                    If ($IsBotSubmitter) {
+
+                        $BotRejectReason = If (!$ServicingEnabled) {
+                            If (!$IsServicingRepo) {
+                                "the servicing scenario doesn't apply to this repo (name must start with `"$ServicingRepoPrefix`")"
+                            } ElseIf (!$GlobalEnableServicingPublish) {
+                                "the servicing scenario is disabled globally"
+                            } Else {
+                                "the servicing scenario is disabled on this repo (EnableServicingPublish is false)"
+                            }
+                        } ElseIf ($ServicingAuthorizedApps.Count -eq 0) {
+                            "no apps are configured in ServicingAuthorizedApps"
+                        } Else {
+                            "app slug `"$SubmitterAppSlug`" is not in the ServicingAuthorizedApps list ($($ServicingAuthorizedApps -join ', '))"
+                        }
+
+                        Write-Host "Bot submitter $Submitter rejected: $BotRejectReason. Exiting silently."
+
+                        Return
+
+                    }
+
+                    $UnauthorizedContext = If ($ServicingEnabled) { $ScenarioServicing } Else { $ScenarioAfterHours }
+                    $UnauthorizedResponse = Build-UnauthorizedResponse -ScenarioInContext $UnauthorizedContext
+
+                }
+
+                Switch ($Command) {
+
+                    $SelfMergeCommand {
+
+                        # Prerequisites depend on scenario:
+                        #   AfterHours: in window, authorized, PR targets default branch, not merged, status checks passing.
+                        #   Servicing: authorized (any time), PR targets default branch, not merged, status checks passing.
+
+                        If ($Null -eq $Scenario) {
+
+                            Write-Host "Submitter $Submitter is not authorized under any applicable scenario. Rejecting $SelfMergeCommand."
+                            Add-PrComment -IssueUrl $IssueUrl -Body $UnauthorizedResponse
+                            Break
+
+                        }
+
+                        # After-hours scenario: enforce the time window.
+                        If ($Scenario -eq $ScenarioAfterHours) {
+
+                            $AfterHours = Test-AfterHours
+
+                            If (!$AfterHours) {
+
+                                Write-Host "Not in after hours. Rejecting $SelfMergeCommand."
+                                Add-PrComment -IssueUrl $IssueUrl -Body $AfterHours_StandardHoursResponse
+                                Break
+
+                            }
+
+                        }
+
+                        $PrData = Invoke-RestMethod -Uri $PrApiUrl -Headers $StandardGitHubHeaders
+
+                        If ($PrData.base.ref -ne $DefaultBranch) {
+
+                            Write-Host "PR #$PrNumber targets `"$($PrData.base.ref)`", not the default branch `"$DefaultBranch`". Rejecting $SelfMergeCommand."
+                            Add-PrComment -IssueUrl $IssueUrl -Body $WrongBaseBranchResponse
+                            Break
+
+                        }
+
+                        If ($PrData.merged) {
+
+                            Write-Host "PR #$PrNumber is already merged. Rejecting $SelfMergeCommand."
+                            Add-PrComment -IssueUrl $IssueUrl -Body $AlreadyMergedResponse
+                            Break
+
+                        }
+
+                        # Draft PRs surface as mergeable_state="unstable" not "draft" in some cases - check the boolean directly
+                        # so the merge endpoint never gets called on a draft (which would 405 with "Pull Request is still a draft").
+                        If ($PrData.draft) {
+
+                            Write-Host "PR #$PrNumber is a draft. Rejecting $SelfMergeCommand."
+                            $DraftRejectionBody = "${MentionPrefix}We can't merge this pull request yet. The PR is a draft. Mark it as ready for review and post ``$SelfMergeCommand`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                            Add-PrComment -IssueUrl $IssueUrl -Body $DraftRejectionBody
+                            Break
+
+                        }
+
+                        # Verify the PR is ready to merge. mergeable_state considers branch protection - it returns "unstable"
+                        # when non-required checks are failing (but required ones pass), and "blocked" only when required
+                        # checks/reviews aren't satisfied. Allow merge when state is "clean" or "unstable"; reject otherwise.
+                        $MergeableState = $PrData.mergeable_state
+
+                        Write-Host "Mergeable state on PR #$PrNumber`: $MergeableState."
+
+                        If ($MergeableState -notin @("clean", "unstable")) {
+
+                            $StateExplanation = Switch ($MergeableState) {
+                                "blocked"  { "One or more required status checks are failing or pending, or required reviews are missing." }
+                                "dirty"    { "The PR has merge conflicts." }
+                                "behind"   { "The PR is behind the base branch and the base requires updating before merge." }
+                                "draft"    { "The PR is a draft. Mark it as ready for review first." }
+                                "unknown"  { "GitHub hasn't finished computing the mergeable state. Try again in a moment." }
+                                default    { "GitHub reports the PR isn't ready to merge (state: ``$MergeableState``)." }
+                            }
+                            $RejectionBody = "${MentionPrefix}We can't merge this pull request yet. $StateExplanation`n`nResolve the issue and post ``$SelfMergeCommand`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+
+                            Write-Host "PR #$PrNumber mergeable_state is `"$MergeableState`". Rejecting $SelfMergeCommand."
+                            Add-PrComment -IssueUrl $IssueUrl -Body $RejectionBody
+                            Break
+
+                        }
+
+                        # Apply the OnDemandPublish label so the pull_request.closed event carries it and the merge handler
+                        # can identify this PR for AutoPublish dispatch. Ensure the label exists on the repo first.
+                        If (!(Test-RepoLabel -RepoUri $RepoLabelUrl -Name $OnDemandLabel)) {
+
+                            New-RepoLabel -RepoUri $RepoLabelUrl -Name $OnDemandLabel -Color $OnDemandLabelColor -Description $OnDemandLabelDescription
+
+                        }
+
+                        Set-PrLabel -IssueUrl $IssueUrl -LabelName $OnDemandLabel
+
+                        # Merge the PR directly via the REST API using the App token. The partner doesn't have direct merge
+                        # permission; the App token does.
+                        $MergeResult = Merge-PullRequest -PullNumber $PrNumber
+
+                        If ($MergeResult.Success) {
+
+                            Add-PrComment -IssueUrl $IssueUrl -Body $MergeSucceededResponse
+                            $ActionTaken = "Merged via ``$SelfMergeCommand`` command. ``$OnDemandLabel`` label applied; AutoPublish will trigger automatically on merge."
+
+                        } Else {
+
+                            $MergeFailedBody = "${MentionPrefix}We couldn't merge this pull request.`n`n**GitHub reported**: $($MergeResult.ErrorMessage)`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                            Add-PrComment -IssueUrl $IssueUrl -Body $MergeFailedBody
+                            $ActionTaken = "Failed to merge via ``$SelfMergeCommand`` command. GitHub: $($MergeResult.ErrorMessage)."
+
+                        }
+
+                        Record-TrackingActivity -Action $ActionTaken -Scenario $Scenario
+
+                    }
+
+                    $RequestPublishCommand {
+
+                        # Prerequisites depend on scenario:
+                        #   AfterHours: in window, authorized, PR merged.
+                        #   Servicing: authorized (any time), PR merged.
+
+                        If ($Null -eq $Scenario) {
+
+                            Write-Host "Submitter $Submitter is not authorized under any applicable scenario. Rejecting $RequestPublishCommand."
+                            Add-PrComment -IssueUrl $IssueUrl -Body $UnauthorizedResponse
+                            Break
+
+                        }
+
+                        # After-hours scenario: enforce the time window.
+                        If ($Scenario -eq $ScenarioAfterHours) {
+
+                            $AfterHours = Test-AfterHours
+
+                            If (!$AfterHours) {
+
+                                Write-Host "Not in after hours. Rejecting $RequestPublishCommand."
+                                Add-PrComment -IssueUrl $IssueUrl -Body $AfterHours_StandardHoursResponse
+                                Break
+
+                            }
+
+                        }
+
+                        $PrData = Invoke-RestMethod -Uri $PrApiUrl -Headers $StandardGitHubHeaders
+
+                        If ($PrData.base.ref -ne $DefaultBranch) {
+
+                            Write-Host "PR #$PrNumber targets `"$($PrData.base.ref)`", not the default branch `"$DefaultBranch`". Rejecting $RequestPublishCommand."
+                            Add-PrComment -IssueUrl $IssueUrl -Body $WrongBaseBranchResponse
+                            Break
+
+                        }
+
+                        If (!$PrData.merged) {
+
+                            Write-Host "PR #$PrNumber is not merged. Rejecting $RequestPublishCommand."
+                            Add-PrComment -IssueUrl $IssueUrl -Body $NotMergedResponse
+                            Break
+
+                        }
+
+                        $Triggered = Invoke-AutoPublish
+
+                        If ($Triggered) {
+
+                            Add-PrComment -IssueUrl $IssueUrl -Body $PublishTriggeredResponse
+                            $ActionTaken = "Triggered AutoPublish workflow via ``$RequestPublishCommand`` command."
+
+                        } Else {
+
+                            Add-PrComment -IssueUrl $IssueUrl -Body $PublishFailedResponse
+                            $ActionTaken = "Failed to trigger AutoPublish workflow via ``$RequestPublishCommand`` command."
+
+                        }
+
+                        Record-TrackingActivity -Action $ActionTaken -Scenario $Scenario
+
+                    }
+
+                }

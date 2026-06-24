@@ -43,7 +43,8 @@ jobs:
                     "BuildValidation.yml",
                     "GuidAssign.yml",
                     "GuidCheck.yml",
-                    "LiveMergeCheck.yml",    
+                    "LiveMergeCheck.yml",
+                    "OnDemandPublish.yml",
                     "M365Endpoints.yml",             
                     "PrFileCount.yml", 
                     "ProtectedFiles.yml", 
@@ -60,13 +61,14 @@ jobs:
                     "Shared-GuidAssign.yml",
                     "Shared-GuidCheck.yml",
                     "Shared-LiveMergeCheck.yml", 
+                    "Shared-OnDemandPublish.yml",
                     "Shared-PrFileCount.yml", 
                     "Shared-ProtectedFiles.yml", 
                     "Shared-Stale.yml",
                     "Shared-StaleBranch.yml",
                     "Shared-TierManagement.yml"
                 ]'
-            ApproverList: '["dstrome", "garycentric"]'
+            ApproverList: '["vinpa", "garycentric"]'
             
             PayloadJson: ${{ inputs.PayloadJson }}
             AccessToken: ${{ secrets.AccessToken }}
