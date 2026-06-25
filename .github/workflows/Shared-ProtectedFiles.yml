@@ -68,7 +68,7 @@ jobs:
                     "Shared-StaleBranch.yml",
                     "Shared-TierManagement.yml"
                 ]'
-            ApproverList: '["vinpa", "garycentric"]'
+            ApproverList: '["vinaypamnani-msft", "garycentric"]'
             
             PayloadJson: ${{ inputs.PayloadJson }}
             AccessToken: ${{ secrets.AccessToken }}
