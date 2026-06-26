@@ -462,15 +462,6 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const prNumber = pr.number;
-            const headRef = pr.head.ref;
-
-            // The "Commit suggestion" (Apply) button only works for people with push access
-            // to the PR's head branch. For a fork PR that requires the author to have enabled
-            // "Allow edits from maintainers" (maintainer_can_modify). Same-repo PRs are always
-            // modifiable by repo writers.
-            const isFork = !!(pr.head.repo && pr.head.repo.full_name
-              && pr.head.repo.full_name !== (owner + '/' + repo));
-            const canModify = !isFork || pr.maintainer_can_modify === true;
 
             function readTsv(p) {
               try {
@@ -503,23 +494,12 @@ jobs:
               } catch (e) { return false; }
             }
 
-            // Build a comment body. When the head branch is modifiable, emit a
-            // ```suggestion``` block so reviewers get a one-click "Commit suggestion".
-            // Otherwise emit plain instructions telling the maintainer to fork the branch
-            // and merge back, because the Apply button would not work for them.
+            // Build a comment body with a ```suggestion``` block so anyone who can push to
+            // the PR's head branch (the fork author, or a writer on a same-repo PR) gets a
+            // one-click "Commit suggestion".
             function mkBody(intro, fixLines) {
-              if (canModify) {
-                return intro + ' Click **Commit suggestion** to apply.\n\n'
-                  + F + 'suggestion\n' + fixLines + '\n' + F + '\n' + MARKER;
-              }
-              return intro + '\n\n'
-                + '> [!IMPORTANT]\n'
-                + '> No one-click fix is available because maintainers can\'t edit this pull '
-                + 'request\'s branch (**Allow edits from maintainers** is off). Please create a '
-                + 'fork of `' + headRef + '`, apply the change below, and merge it back into `'
-                + headRef + '`.\n\n'
-                + 'Apply this change:\n\n'
-                + F + '\n' + fixLines + '\n' + F + '\n' + MARKER;
+              return intro + ' Click **Commit suggestion** to apply.\n\n'
+                + F + 'suggestion\n' + fixLines + '\n' + F + '\n' + MARKER;
             }
 
             // Remove our previous suggestion comments (and legacy plain comments) so re-runs
