@@ -628,3 +628,54 @@ jobs:
               }
             }
             core.info('Posted ' + posted + ' inline suggestion(s), ' + fallback + ' fallback comment(s).');
+
+      - name: GUID check results summary
+        if: always()
+        env:
+          MISSING_OUTCOME: ${{ steps.missing.outcome }}
+          DUPES_OUTCOME: ${{ steps.check.outcome }}
+          CHANGED_OUTCOME: ${{ steps.changed.outcome }}
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          # Count non-empty lines in a results file (0 if the file was never created).
+          count_lines() { if [ -f "$1" ]; then awk 'NF' "$1" | wc -l | tr -d ' '; else echo 0; fi; }
+          MISSING=$(count_lines /tmp/missing_guids.txt)
+          CHANGED=$(count_lines /tmp/changed_guids.txt)
+
+          # Duplicate files needing a new GUID = sum over dupe groups of (files in group - 1 owner).
+          DUPES=0
+          if [ -f /tmp/dupes.txt ]; then
+            while IFS=$'\t' read -r _guid files; do
+              n=$(printf '%s' "$files" | tr '|' '\n' | awk 'NF' | wc -l | tr -d ' ')
+              if [ "$n" -gt 1 ]; then DUPES=$((DUPES + n - 1)); fi
+            done < /tmp/dupes.txt
+          fi
+
+          # Result cell: ":heavy_minus_sign: Not run" if the step was skipped, ":x: Fail"
+          # if it flagged files, otherwise ":white_check_mark: Pass".
+          result() {
+            if [ "$1" = "skipped" ]; then printf ':heavy_minus_sign: Not run';
+            elif [ "${2:-0}" -gt 0 ]; then printf ':x: Fail';
+            else printf ':white_check_mark: Pass'; fi
+          }
+
+          TOTAL=$((MISSING + DUPES + CHANGED))
+          if [ "$TOTAL" -gt 0 ]; then
+            OVERALL=":x: **Failed** - resolve the $TOTAL flagged file(s). See the inline review comments for the suggested fix on each."
+          else
+            OVERALL=":white_check_mark: **Passed** - all article GUIDs are present and unique."
+          fi
+
+          {
+            echo "# GUID check results"
+            echo ""
+            echo "$OVERALL"
+            echo ""
+            echo "| Check | Result | Files |"
+            echo "| --- | :---: | ---: |"
+            echo "| Missing GUID | $(result "$MISSING_OUTCOME" "$MISSING") | $MISSING |"
+            echo "| Duplicate GUID | $(result "$DUPES_OUTCOME" "$DUPES") | $DUPES |"
+            echo "| Changed / removed GUID | $(result "$CHANGED_OUTCOME" "$CHANGED") | $CHANGED |"
+          } >> "$GITHUB_STEP_SUMMARY"
