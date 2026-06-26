@@ -41,12 +41,17 @@ jobs:
         run: echo "PR_FILES_DIR=$RUNNER_TEMP/pr-files" >> "$GITHUB_ENV"
 
       # Trusted base checkout for the repo-wide duplicate inventory and base-side GUID
-      # reads. No `ref:` -> under pull_request_target this is the base branch we control.
-      # persist-credentials: false keeps the privileged token out of .git/config; all
-      # analysis below is local git reads that need no credentials.
+      # reads. ref is pinned to the PR's BASE branch (github.base_ref) so the working-tree
+      # GUID inventory reflects the branch this PR actually targets — not the repo default
+      # branch. (Without an explicit ref, checkout lands on the default branch, which makes
+      # the inventory and the `origin/$BASE_REF` reads disagree for PRs targeting a
+      # non-default branch.) base_ref is the upstream target branch, never fork-controlled,
+      # so checking it out is safe. persist-credentials: false keeps the privileged token
+      # out of .git/config; all analysis below is local git reads that need no credentials.
       - name: Checkout base (trusted)
         uses: actions/checkout@v5
         with:
+          ref: ${{ github.base_ref }}
           fetch-depth: 0
           persist-credentials: false
 
