@@ -1,0 +1,363 @@
+name: Sync KB redirects to siteroot
+
+# Reusable workflow that regenerates the KB redirect JSON for a calling
+# enduser-servicing-* docset and opens an auto-merging pull request in the
+# external enduser-siteroot-pr repo.
+#
+# Cross-repo read/write is performed with a GitHub App installation token.
+#
+# The redirect JSON is regenerated on every run (no commit-content gating). The
+# commit step is a natural no-op when the regenerated JSON matches what is
+# already in the siteroot repo (git detects no diff, so no branch/PR is created).
+
+# The GITHUB_TOKEN only needs read access to check out the calling repo; all
+# cross-repo writes (push, PR, auto-merge) use the GitHub App installation token.
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      PayloadJson:
+        description: 'toJSON(github) from the calling workflow.'
+        required: true
+        type: string
+      SiterootRepo:
+        description: 'owner/repo of the external siteroot repo that stores redirect JSON.'
+        required: false
+        type: string
+        default: 'MicrosoftDocs/enduser-siteroot-pr'
+      SiterootBranch:
+        description: 'Base branch in the siteroot repo to target with the PR.'
+        required: false
+        type: string
+        default: 'main'
+    secrets:
+      PrivateKey:
+        required: true
+      ClientId:
+        required: true
+
+# Group runs per calling repo + branch and let each run finish (do not cancel
+# in-progress runs) so that subsequent live commits queue up and we avoid
+# colliding redirect regenerations. NOTE: this uses a distinct group name from
+# the calling workflow's top-level concurrency group on purpose — using the same
+# group name in both a caller and its reusable workflow can deadlock.
+concurrency:
+  group: kb-redirect-sync-shared-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync-redirects:
+    name: Sync KB redirects
+    if: github.repository_owner == 'MicrosoftDocs' && contains(github.event.repository.topics, 'build')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.ClientId }}
+          private-key: ${{ secrets.PrivateKey }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Check out calling repo (live)
+        id: checkout-caller
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ fromJson(inputs.PayloadJson).sha }}
+          path: caller
+          # Only materialize Markdown articles in the working tree. Images and
+          # other large assets are skipped (the redirect logic only reads .md).
+          # Non-cone mode is required for gitignore-style file patterns.
+          sparse-checkout: '**/*.md'
+          sparse-checkout-cone-mode: false
+
+      - name: Clone siteroot repo
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.SiterootRepo }}
+          ref: ${{ inputs.SiterootBranch }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: siteroot
+          fetch-depth: 0
+
+      - name: Generate redirect JSON
+        id: generate
+        shell: pwsh
+        env:
+          PayloadJson: ${{ inputs.PayloadJson }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $GitHubData = $env:PayloadJson | ConvertFrom-Json -Depth 50
+          $DocsetName = $GitHubData.event.repository.name
+
+          # ---------------------------------------------------------------
+          # Base-path mapping, keyed by repo name then docset folder name.
+          # A single repo can contain multiple docset folders that each map to
+          # a different base path, so the inner key is the top-level folder name
+          # (relative to the repo root) that contains the articles.
+          # $BasePathMap[<repo name>][<docset folder name>] = <base path>
+          # ---------------------------------------------------------------
+          $BasePathMap = @{
+              'enduser-servicing-windows-pr'    = @{ 'Windows' = '/servicing/os' }
+              'enduser-servicing-developer-pr'  = @{
+                  'DotNet'          = '/servicing/dotnet'
+                  'DotNetFramework' = '/servicing/dotnetframework'
+                  'Developer'       = '/servicing/developer'
+                  'Visual-Studio'   = '/servicing/visual-studio'
+              }
+              'enduser-servicing-azure-pr'      = @{ 'Azure' = '/servicing/azure' }
+              'enduser-servicing-biztalk-pr'    = @{ 'BizTalk-Server' = '/servicing/biztalk' }
+              'enduser-servicing-dynamics-pr'   = @{ 'Dynamics' = '/servicing/dynamics' }
+              'enduser-servicing-his-pr'        = @{ 'Host-Integration-Server' = '/servicing/host-integration-server' }
+              'enduser-servicing-pr'            = @{
+                  'Internet-Information-Server' = '/servicing/internet-information-server'
+                  'Servers'                    = '/servicing/servers'
+                  'Servicing'                  = '/servicing'
+              }
+              'enduser-servicing-mgmt-tools-pr' = @{ 'Management-Tools' = '/servicing/management-tools' }
+              'enduser-servicing-skype-pr'      = @{ 'Skype' = '/servicing/skype' }
+              'enduser-servicing-sql-pr'        = @{ 'SQL' = '/servicing/sql' }
+              'enduser-servicing-office-pr'     = @{ 'Office' = '/servicing/office' }
+          }
+
+          $FolderMap = $BasePathMap[$DocsetName]
+          if (-not $FolderMap) {
+              Write-Host "::error::No base path mapping found for repo '$DocsetName'. Add it to `$BasePathMap in Shared-KbRedirectSync.yml."
+              exit 1
+          }
+
+          # Evaluate ALL .md articles in the calling repo (not just changed ones)
+          # and build the complete set of redirections.
+          $CallerRoot = (Resolve-Path 'caller').Path
+          $Articles = Get-ChildItem -Path caller -Recurse -Filter *.md -File
+
+          $Redirections = foreach ($Article in $Articles) {
+              # Determine the docset folder (top-level folder under the repo root)
+              # and resolve its base path. Articles outside a mapped folder (e.g.
+              # repo-root files) are skipped.
+              $RelPath = [System.IO.Path]::GetRelativePath($CallerRoot, $Article.FullName) -replace '\\', '/'
+              $DocsetFolder = ($RelPath -split '/')[0]
+              $BasePath = $FolderMap[$DocsetFolder]
+              if ([string]::IsNullOrWhiteSpace($BasePath)) { continue }
+
+              $Lines = @(Get-Content -LiteralPath $Article.FullName)
+              if ($Lines.Count -lt 1 -or $Lines[0].Trim() -ne '---') { continue }
+              $End = -1
+              for ($i = 1; $i -lt $Lines.Count; $i++) {
+                  if ($Lines[$i].Trim() -eq '---') { $End = $i; break }
+              }
+              if ($End -lt 0) { continue }
+              $Frontmatter = $Lines[1..($End - 1)]
+              $KbLine = $Frontmatter | Where-Object { $_ -match '^\s*awa-kb_id\s*:\s*(\S+)' } | Select-Object -First 1
+              if (-not $KbLine) { continue }
+              $KbId = ($KbLine -replace '^\s*awa-kb_id\s*:\s*', '').Trim().Trim('"', "'")
+
+              # redirect_url = BasePath + the article path relative to its docset
+              # folder, with the .md extension stripped (subfolders preserved).
+              $RelWithinFolder = ($RelPath.Substring($DocsetFolder.Length).TrimStart('/')) -replace '\.md$', ''
+
+              [ordered]@{
+                  source_path_from_root = "/KB-Redirects/$KbId.md"
+                  redirect_url          = "$BasePath/$RelWithinFolder"
+                  redirect_document_id  = $false
+              }
+          }
+
+          # foreach yields $null for zero matches and a scalar for a single match;
+          # @() normalizes to an array.
+          $Redirections = @($Redirections)
+
+          Write-Host "Generated $($Redirections.Count) redirection(s) for repo '$DocsetName'."
+
+          # Safety guard: never publish an empty redirect set. Generating zero
+          # entries almost always indicates a transient problem (e.g. articles not
+          # checked out) rather than an intentional removal of every redirect.
+          # Writing an empty file here could wipe live redirects via auto-merge, so
+          # skip the write and let the run no-op instead.
+          if ($Redirections.Count -eq 0) {
+              Write-Host "::warning::No KB redirect entries were generated for '$DocsetName'. Skipping write to avoid overwriting existing redirects."
+              exit 0
+          }
+
+          # Sort with the invariant culture (-Culture '') for a stable,
+          # locale-independent order, then serialize to { "redirections": [ ... ] }
+          # in a single pass. @() keeps a single entry as a JSON array.
+          $Sorted = @($Redirections | Sort-Object { $_.source_path_from_root } -Culture '')
+          $Json = @{ redirections = $Sorted } | ConvertTo-Json -Depth 5
+
+          $RedirectFileName = ".openpublishing.redirection.$DocsetName-redirects.json"
+          $TargetPath = Join-Path 'siteroot' (Join-Path 'KB-Redirects' $RedirectFileName)
+          $TargetDir = Split-Path -Parent $TargetPath
+          if ($TargetDir -and -not (Test-Path $TargetDir)) {
+              New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+          }
+          $Json | Set-Content -LiteralPath $TargetPath -Encoding utf8
+          Write-Host "Wrote redirect JSON to $TargetPath"
+
+          # Ensure the generated redirect file is registered in the siteroot
+          # publish config's redirection_files list. Add it (with a minimal,
+          # format-preserving edit) if it is not already present.
+          $ConfigPath = Join-Path (Resolve-Path 'siteroot').Path '.openpublishing.publish.config.json'
+          $RelRedirectPath = "KB-Redirects/$RedirectFileName"
+          if (-not (Test-Path $ConfigPath)) {
+              Write-Host "::warning::Publish config not found at $ConfigPath; skipping redirection_files registration."
+          } else {
+              $ConfigRaw = Get-Content -Raw -LiteralPath $ConfigPath
+              $Config = $ConfigRaw | ConvertFrom-Json
+              $ExistingFiles = @($Config.redirection_files | Where-Object { $_ })
+              if ($ExistingFiles -contains $RelRedirectPath) {
+                  Write-Host "Publish config already lists '$RelRedirectPath'."
+              } else {
+                  $AllFiles = @($ExistingFiles) + $RelRedirectPath
+                  $EntriesText = ($AllFiles | ForEach-Object { '    "' + $_ + '"' }) -join ",`n"
+                  $Replacement = '"redirection_files": [' + "`n" + $EntriesText + "`n" + '  ]'
+                  $Rx = [regex]'(?s)"redirection_files"\s*:\s*\[.*?\]'
+                  if (-not $Rx.IsMatch($ConfigRaw)) {
+                      throw "Could not locate redirection_files array in $ConfigPath"
+                  }
+                  $NewConfig = $Rx.Replace($ConfigRaw, [System.Text.RegularExpressions.MatchEvaluator] { param($m) $Replacement }, 1)
+                  [System.IO.File]::WriteAllText($ConfigPath, $NewConfig)
+                  Write-Host "Added '$RelRedirectPath' to redirection_files in publish config."
+              }
+          }
+
+      - name: Commit and push topic branch
+        id: commit
+        shell: pwsh
+        env:
+          PayloadJson: ${{ inputs.PayloadJson }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $GitHubData = $env:PayloadJson | ConvertFrom-Json -Depth 50
+          $DocsetName = $GitHubData.event.repository.name
+          $ShortSha = $GitHubData.sha.Substring(0, [Math]::Min(7, $GitHubData.sha.Length))
+
+          Set-Location siteroot
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          $Status = git status --porcelain
+          if ([string]::IsNullOrWhiteSpace($Status)) {
+              Write-Host "No redirect changes detected. Nothing to commit."
+              "has_changes=false" >> $env:GITHUB_OUTPUT
+              return
+          }
+
+          $Branch = "kb-redirect-sync/$DocsetName-$ShortSha-$($env:GITHUB_RUN_ID)"
+          git checkout -b $Branch
+          git add -A
+          git commit -m "Sync KB redirects from $DocsetName ($ShortSha)"
+          git push origin $Branch
+
+          "has_changes=true" >> $env:GITHUB_OUTPUT
+          "branch=$Branch" >> $env:GITHUB_OUTPUT
+
+      - name: Create PR and enable auto-merge
+        if: steps.commit.outputs.has_changes == 'true'
+        shell: pwsh
+        env:
+          PayloadJson: ${{ inputs.PayloadJson }}
+          SiterootRepo: ${{ inputs.SiterootRepo }}
+          SiterootBranch: ${{ inputs.SiterootBranch }}
+          Branch: ${{ steps.commit.outputs.branch }}
+          AppGitHubAccessToken: ${{ steps.app-token.outputs.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $GitHubData = $env:PayloadJson | ConvertFrom-Json -Depth 50
+          $DocsetName = $GitHubData.event.repository.name
+          $SiterootRepo = $env:SiterootRepo
+          $BaseBranch = $env:SiterootBranch
+          $HeadBranch = $env:Branch
+
+          $Headers = @{
+              Authorization = "token $($env:AppGitHubAccessToken)"
+              'User-Agent'  = 'OfficeDocs'
+              Accept        = 'application/vnd.github+json'
+          }
+
+          # Create the PR (head topic branch -> base branch) in the siteroot repo.
+          $PrBody = @{
+              title = "[KbRedirectSync] Update KB redirects for $DocsetName"
+              head  = $HeadBranch
+              base  = $BaseBranch
+              body  = "Automated KB redirect sync from ``$DocsetName`` live branch.`n`nThis PR regenerates the redirect JSON and will auto-merge when checks pass."
+          } | ConvertTo-Json
+
+          $Pr = Invoke-RestMethod -Uri "https://api.github.com/repos/$SiterootRepo/pulls" -Method POST -Headers $Headers -Body $PrBody
+          $PrNumber = $Pr.number
+          $NodeId = $Pr.node_id
+          Write-Host "Created PR #$PrNumber : $($Pr.html_url)"
+
+          # Enable auto-merge via GraphQL (same pattern as Shared-AutoPublishV2),
+          # retrying while GitHub evaluates the PR's mergeable state.
+          $Mutation = @"
+          mutation (`$id: ID!, `$method: PullRequestMergeMethod!) {
+            enablePullRequestAutoMerge(input: {pullRequestId: `$id, mergeMethod: `$method}) {
+              pullRequest { autoMergeRequest { enabledAt mergeMethod } }
+            }
+          }
+          "@
+
+          $Enabled = $false
+          for ($i = 0; $i -lt 6 -and -not $Enabled; $i++) {
+              $MutationBody = @{ query = $Mutation; variables = @{ id = $NodeId; method = 'MERGE' } } | ConvertTo-Json -Depth 5
+              try {
+                  $Resp = Invoke-RestMethod -Uri 'https://api.github.com/graphql' -Method POST -Headers $Headers -Body $MutationBody
+                  $EnabledAt = $Resp.data.enablePullRequestAutoMerge.pullRequest.autoMergeRequest.enabledAt
+                  if ($EnabledAt) {
+                      Write-Host "Auto-merge enabled for PR #$PrNumber at $EnabledAt."
+                      $Enabled = $true
+                      break
+                  }
+                  Write-Host "Auto-merge not yet enabled (attempt $i). Response:`n$($Resp | ConvertTo-Json -Depth 10)"
+              } catch {
+                  Write-Host "Auto-merge attempt $i failed: $_"
+              }
+              Start-Sleep -Seconds ([Math]::Pow(2, $i))
+          }
+
+          if (-not $Enabled) {
+              Write-Host "::warning::Could not enable auto-merge for PR #$PrNumber. Manual merge may be required."
+          }
+
+          # --- Visibility: label the PR and post a status comment ---------------
+          # Helps the PR get noticed when it needs human action (approval or a
+          # manual merge under 'changes via PR' rules). Harmless when auto-merge
+          # completes unattended. Labeling/commenting failures are non-fatal.
+          function Add-PrLabel {
+              param([int] $Number, [string] $Name, [string] $Color, [string] $Description)
+              try {
+                  $LabelBody = @{ name = $Name; color = $Color; description = $Description } | ConvertTo-Json
+                  Invoke-RestMethod -Uri "https://api.github.com/repos/$SiterootRepo/labels" -Method POST -Headers $Headers -Body $LabelBody -ErrorAction Stop | Out-Null
+              } catch {
+                  # A 422 means the label already exists; any other error is non-fatal here.
+              }
+              try {
+                  $AddBody = @{ labels = @($Name) } | ConvertTo-Json
+                  Invoke-RestMethod -Uri "https://api.github.com/repos/$SiterootRepo/issues/$Number/labels" -Method POST -Headers $Headers -Body $AddBody -ErrorAction Stop | Out-Null
+              } catch {
+                  Write-Host "::warning::Could not add label '$Name' to PR #$Number`: $_"
+              }
+          }
+
+          function Add-PrComment {
+              param([int] $Number, [string] $Body)
+              try {
+                  $CommentBody = @{ body = $Body } | ConvertTo-Json
+                  Invoke-RestMethod -Uri "https://api.github.com/repos/$SiterootRepo/issues/$Number/comments" -Method POST -Headers $Headers -Body $CommentBody -ErrorAction Stop | Out-Null
+              } catch {
+                  Write-Host "::warning::Could not comment on PR #$Number`: $_"
+              }
+          }
+
+          Add-PrLabel -Number $PrNumber -Name 'KB redirect sync' -Color '1d76db' -Description 'Automated KB redirect sync pull request.'
+
+          if ($Enabled) {
+              Add-PrComment -Number $PrNumber -Body "Auto-merge is enabled for this KB redirect sync PR. It will merge automatically once all required status checks (and any required approvals) are satisfied. If this repository requires a review, a maintainer needs to approve it before the merge can proceed."
+          } else {
+              Add-PrLabel -Number $PrNumber -Name 'Manual merge required' -Color 'f79d43' -Description 'An automated PR could not be auto-merged and needs a manual merge.'
+              Add-PrComment -Number $PrNumber -Body "Auto-merge could not be enabled for this KB redirect sync PR, so it will not merge on its own. A maintainer needs to review and merge it manually to publish the updated KB redirects."
+          }
