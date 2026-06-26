@@ -463,6 +463,14 @@ jobs:
             const repo = context.repo.repo;
             const prNumber = pr.number;
 
+            // The "Commit suggestion" (Apply) button only renders for viewers who can push
+            // to the PR's head branch. On a fork PR the contributor (author) owns the fork
+            // branch and can Apply, so the suggestion block is genuinely useful. On a
+            // same-repo PR we skip the block and show the value as plain text, to avoid
+            // showing an "apply me" affordance to people who can't act on it.
+            const isFork = !!(pr.head.repo && pr.head.repo.full_name
+              && pr.head.repo.full_name !== (owner + '/' + repo));
+
             function readTsv(p) {
               try {
                 const t = fs.readFileSync(p, 'utf8').trim();
@@ -494,12 +502,16 @@ jobs:
               } catch (e) { return false; }
             }
 
-            // Build a comment body with a ```suggestion``` block so anyone who can push to
-            // the PR's head branch (the fork author, or a writer on a same-repo PR) gets a
-            // one-click "Commit suggestion".
+            // Build a comment body. On a fork PR, emit a ```suggestion``` block so the
+            // contributor gets a one-click "Commit suggestion". On a same-repo PR, show the
+            // value as a plain code block (no apply affordance).
             function mkBody(intro, fixLines) {
-              return intro + ' Click **Commit suggestion** to apply.\n\n'
-                + F + 'suggestion\n' + fixLines + '\n' + F + '\n' + MARKER;
+              if (isFork) {
+                return intro + ' Click **Commit suggestion** to apply.\n\n'
+                  + F + 'suggestion\n' + fixLines + '\n' + F + '\n' + MARKER;
+              }
+              return intro + ' Update the `awa-articleGuid` as shown:\n\n'
+                + F + '\n' + fixLines + '\n' + F + '\n' + MARKER;
             }
 
             // Remove our previous suggestion comments (and legacy plain comments) so re-runs
