@@ -74,38 +74,10 @@ jobs:
               if (!f.filename.endsWith('.md')) continue;
               if (f.filename.includes('/includes/')) continue;
 
-              // Determine the effective status. GitHub's rename detection can mis-label a
-              // *copy* (where the original file still exists on the head) as "renamed".
-              // If trusted, the changed/removed-GUID check would compare the new copy's
-              // GUID against the original's and wrongly flag an "accidentally changed GUID".
-              // So for a "renamed" file, verify the previous path is actually gone on the
-              // head; if it still exists, treat this file as an add (a brand-new article).
-              let effStatus = f.status;
-              let effPrevious = f.previous_filename || null;
-              if (effStatus === 'renamed' && effPrevious) {
-                let prevExistsOnHead = false;
-                try {
-                  await github.rest.repos.getContent({
-                    owner: headRepo.owner.login,
-                    repo: headRepo.name,
-                    path: effPrevious,
-                    ref: headSha,
-                  });
-                  prevExistsOnHead = true;
-                } catch (e) {
-                  prevExistsOnHead = false; // 404 => true rename (old path removed)
-                }
-                if (prevExistsOnHead) {
-                  core.info(`Treating ${f.filename} as 'added': previous '${effPrevious}' still exists on head (copy, not rename).`);
-                  effStatus = 'added';
-                  effPrevious = null;
-                }
-              }
-
               manifest.push({
                 path: f.filename,
-                status: effStatus,
-                previous: effPrevious,
+                status: f.status,
+                previous: f.previous_filename || null,
               });
 
               if (f.status === 'removed') continue;
@@ -491,6 +463,14 @@ jobs:
             const repo = context.repo.repo;
             const prNumber = pr.number;
 
+            // The "Commit suggestion" (Apply) button only renders for viewers who can push
+            // to the PR's head branch. On a fork PR the contributor (author) owns the fork
+            // branch and can Apply, so the suggestion block is genuinely useful. On a
+            // same-repo PR we skip the block and show the value as plain text, to avoid
+            // showing an "apply me" affordance to people who can't act on it.
+            const isFork = !!(pr.head.repo && pr.head.repo.full_name
+              && pr.head.repo.full_name !== (owner + '/' + repo));
+
             function readTsv(p) {
               try {
                 const t = fs.readFileSync(p, 'utf8').trim();
@@ -520,6 +500,18 @@ jobs:
                 const m = content.match(/awa-articleGuid:\s*(\S+)/i);
                 return m && m[1].toLowerCase() === guid.toLowerCase();
               } catch (e) { return false; }
+            }
+
+            // Build a comment body. On a fork PR, emit a ```suggestion``` block so the
+            // contributor gets a one-click "Commit suggestion". On a same-repo PR, show the
+            // value as a plain code block (no apply affordance).
+            function mkBody(intro, fixLines) {
+              if (isFork) {
+                return intro + ' Click **Commit suggestion** to apply.\n\n'
+                  + F + 'suggestion\n' + fixLines + '\n' + F + '\n' + MARKER;
+              }
+              return intro + ' Update the `awa-articleGuid` as shown:\n\n'
+                + F + '\n' + fixLines + '\n' + F + '\n' + MARKER;
             }
 
             // Remove our previous suggestion comments (and legacy plain comments) so re-runs
@@ -552,9 +544,9 @@ jobs:
               const parts = ln.split('\t');
               const file = parts[0]; const guid = parts[1];
               if (!file) continue;
-              const body = '**Missing `awa-articleGuid`.** This new article needs a unique GUID. '
-                + 'Click **Commit suggestion** to add the one below (or edit it to your own), then it is saved to this PR.\n\n'
-                + F + 'suggestion\n' + firstLine(file) + '\nawa-articleGuid: ' + guid + '\n' + F + '\n' + MARKER;
+              const body = mkBody(
+                '**Missing `awa-articleGuid`.** This new article needs a unique GUID.',
+                firstLine(file) + '\nawa-articleGuid: ' + guid);
               items.push({ file: file, line: 1, body: body });
             }
 
@@ -564,16 +556,16 @@ jobs:
               const file = parts[0]; const baseGuid = parts[1]; const current = parts[2];
               if (!file) continue;
               if (current === '(removed)') {
-                const body = '**`awa-articleGuid` was removed.** Existing articles must keep their GUID. '
-                  + 'Click **Commit suggestion** to restore it.\n\n'
-                  + F + 'suggestion\n' + firstLine(file) + '\nawa-articleGuid: ' + baseGuid + '\n' + F + '\n' + MARKER;
+                const body = mkBody(
+                  '**`awa-articleGuid` was removed.** Existing articles must keep their GUID.',
+                  firstLine(file) + '\nawa-articleGuid: ' + baseGuid);
                 items.push({ file: file, line: 1, body: body });
               } else {
                 const gl = guidLine(file);
                 if (gl) {
-                  const body = '**`awa-articleGuid` was changed.** Existing articles must keep their original GUID. '
-                    + 'Click **Commit suggestion** to restore it.\n\n'
-                    + F + 'suggestion\nawa-articleGuid: ' + baseGuid + '\n' + F + '\n' + MARKER;
+                  const body = mkBody(
+                    '**`awa-articleGuid` was changed.** Existing articles must keep their original GUID.',
+                    'awa-articleGuid: ' + baseGuid);
                   items.push({ file: file, line: gl, body: body });
                 }
               }
@@ -588,13 +580,21 @@ jobs:
               const keep = all.filter(function (f) { return hadGuidOnBase(f, guid); });
               let change = all.filter(function (f) { return !hadGuidOnBase(f, guid); });
               if (keep.length === 0 && change.length > 1) change = change.slice(1);
+              // Files that keep this GUID (the existing owner of the identity). Reported in
+              // the comment so the author sees exactly which article their GUID collides with.
+              const retained = all.filter(function (f) { return change.indexOf(f) === -1; });
               for (const f of change) {
                 const gl = guidLine(f);
                 if (gl) {
                   const newGuid = crypto.randomUUID();
-                  const body = '**Duplicate `awa-articleGuid`** \u2014 `' + guid + '` is already used by another article. '
-                    + 'Click **Commit suggestion** to replace it with a new unique GUID.\n\n'
-                    + F + 'suggestion\nawa-articleGuid: ' + newGuid + '\n' + F + '\n' + MARKER;
+                  const others = retained.filter(function (x) { return x !== f; });
+                  const usedBy = others.length
+                    ? 'already used by ' + others.map(function (x) { return '`' + x + '`'; }).join(', ')
+                    : 'used by more than one file in this PR';
+                  const body = mkBody(
+                    '**Duplicate `awa-articleGuid`** \u2014 `' + guid + '` is ' + usedBy
+                      + '. Each article needs its own unique GUID.',
+                    'awa-articleGuid: ' + newGuid);
                   items.push({ file: f, line: gl, body: body });
                 }
               }
@@ -620,3 +620,54 @@ jobs:
               }
             }
             core.info('Posted ' + posted + ' inline suggestion(s), ' + fallback + ' fallback comment(s).');
+
+      - name: GUID check results summary
+        if: always()
+        env:
+          MISSING_OUTCOME: ${{ steps.missing.outcome }}
+          DUPES_OUTCOME: ${{ steps.check.outcome }}
+          CHANGED_OUTCOME: ${{ steps.changed.outcome }}
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          # Count non-empty lines in a results file (0 if the file was never created).
+          count_lines() { if [ -f "$1" ]; then awk 'NF' "$1" | wc -l | tr -d ' '; else echo 0; fi; }
+          MISSING=$(count_lines /tmp/missing_guids.txt)
+          CHANGED=$(count_lines /tmp/changed_guids.txt)
+
+          # Duplicate files needing a new GUID = sum over dupe groups of (files in group - 1 owner).
+          DUPES=0
+          if [ -f /tmp/dupes.txt ]; then
+            while IFS=$'\t' read -r _guid files; do
+              n=$(printf '%s' "$files" | tr '|' '\n' | awk 'NF' | wc -l | tr -d ' ')
+              if [ "$n" -gt 1 ]; then DUPES=$((DUPES + n - 1)); fi
+            done < /tmp/dupes.txt
+          fi
+
+          # Result cell: ":heavy_minus_sign: Not run" if the step was skipped, ":x: Fail"
+          # if it flagged files, otherwise ":white_check_mark: Pass".
+          result() {
+            if [ "$1" = "skipped" ]; then printf ':heavy_minus_sign: Not run';
+            elif [ "${2:-0}" -gt 0 ]; then printf ':x: Fail';
+            else printf ':white_check_mark: Pass'; fi
+          }
+
+          TOTAL=$((MISSING + DUPES + CHANGED))
+          if [ "$TOTAL" -gt 0 ]; then
+            OVERALL=":x: **Failed** - resolve the $TOTAL flagged file(s). See the inline review comments for the suggested fix on each."
+          else
+            OVERALL=":white_check_mark: **Passed** - all article GUIDs are present and unique."
+          fi
+
+          {
+            echo "# GUID check results"
+            echo ""
+            echo "$OVERALL"
+            echo ""
+            echo "| Check | Result | Files |"
+            echo "| --- | :---: | ---: |"
+            echo "| Missing GUID | $(result "$MISSING_OUTCOME" "$MISSING") | $MISSING |"
+            echo "| Duplicate GUID | $(result "$DUPES_OUTCOME" "$DUPES") | $DUPES |"
+            echo "| Changed / removed GUID | $(result "$CHANGED_OUTCOME" "$CHANGED") | $CHANGED |"
+          } >> "$GITHUB_STEP_SUMMARY"
